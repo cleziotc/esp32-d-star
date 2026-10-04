@@ -142,16 +142,36 @@
     </section>
 
     <section class="page" id="page-update">
-      <div class="page-title"><div><h1>◆ Atualização de Firmware</h1><p>Atualize o hotspot diretamente pelo GitHub ou envie um firmware manualmente.</p></div></div>
-      <div class="grid two-col">
-        <article class="card">
-          <h2>Versão atual</h2>
-          <div class="firmware-version">Polar D-Star <b id="otaFirmwareVersion">--</b></div>
-          <div id="buildInfo" class="hint">--</div>
+      <div class="page-title"><div><h1>◆ Atualização de Firmware</h1><p>Consulte a release publicada no GitHub, compare com a instalada e atualize o hotspot com segurança.</p></div></div>
+      <div class="grid two-col release-grid">
+        <article class="card release-card">
+          <div class="release-card-head">
+            <div><span class="release-eyebrow">RELEASE INSTALADA</span><div class="firmware-version">Polar D-Star <b id="otaFirmwareVersion">--</b></div></div>
+            <span class="pill release-badge ok">ATIVA</span>
+          </div>
+          <div class="release-meta">
+            <div><span>Versão</span><b id="installedVersion">—</b></div>
+            <div><span>Build</span><b id="buildInfo">—</b></div>
+            <div><span>ESP-IDF</span><b id="installedIdf">—</b></div>
+            <div><span>Alvo</span><b id="installedTarget">—</b></div>
+            <div><span>Partição ativa</span><b id="installedPartition">—</b></div>
+            <div class="wide"><span>SHA-256 do ELF</span><code id="installedSha">—</code></div>
+          </div>
+          <div class="release-notes"><span>Informações desta release</span><p id="installedNotes">Carregando...</p></div>
         </article>
-        <article class="card form-card">
-          <h2>Atualização online</h2>
-          <div class="update-online-row"><span>Última versão no GitHub</span><b id="onlineUpdateVersion">—</b></div>
+        <article class="card form-card release-card">
+          <div class="release-card-head">
+            <div><span class="release-eyebrow">ÚLTIMA RELEASE NO GITHUB</span><div class="firmware-version">Polar D-Star <b id="onlineUpdateVersion">—</b></div></div>
+            <span id="onlineReleaseBadge" class="pill release-badge wait">NÃO VERIFICADO</span>
+          </div>
+          <div class="release-meta">
+            <div><span>Publicada</span><b id="onlinePublishedAt">—</b></div>
+            <div><span>ESP-IDF</span><b id="onlineIdf">—</b></div>
+            <div><span>Alvo</span><b id="onlineTarget">—</b></div>
+            <div><span>Tamanho</span><b id="onlineSize">—</b></div>
+            <div class="wide"><span>SHA-256 do firmware</span><code id="onlineSha">—</code></div>
+          </div>
+          <div class="release-notes"><span>Notas da release</span><p id="onlineNotes">Aguardando consulta ao GitHub...</p></div>
           <p id="onlineUpdateState" class="hint">Ainda não verificado.</p>
           <div class="reflector-actions">
             <button class="ghost" id="checkUpdateBtn" type="button">Verificar agora</button>
@@ -162,7 +182,7 @@
         </article>
         <article class="card form-card span-2">
           <h2>Atualização manual</h2>
-          <p class="hint">Use esta opção como alternativa de recuperação ou para instalar um arquivo <b>.bin</b> específico.</p>
+          <p class="hint">Alternativa de recuperação para instalar manualmente um arquivo <b>.bin</b> específico.</p>
           <div class="dropzone" id="dropzone"><span>☁</span><b>Selecione um firmware .bin</b><input type="file" id="otaFile" accept=".bin,application/octet-stream"></div>
           <button class="primary" id="otaBtn" type="button">Iniciar atualização manual</button>
           <div class="progress"><i id="otaProgress"></i></div><p id="otaMsg" class="hint"></p>
