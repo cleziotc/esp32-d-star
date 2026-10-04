@@ -1,0 +1,50 @@
+name: ESP32-S3 Build
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "csv/**"
+      - "lookup/**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build with ESP-IDF 6.1
+        run: |
+          docker run --rm \
+            -v "$PWD:/project" \
+            -w /project \
+            espressif/idf:v6.1 \
+            bash -lc "python3 tools/generate_web_assets.py && idf.py set-target esp32s3 && idf.py build"
+
+      - name: Package firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/polar_dstar_esp32.bin dist/
+          cp build/bootloader/bootloader.bin dist/
+          cp build/partition_table/partition-table.bin dist/
+          if [ -f build/ota_data_initial.bin ]; then
+            cp build/ota_data_initial.bin dist/
+          fi
+          sha256sum dist/*.bin > dist/SHA256SUMS.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: polar-dstar-esp32
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
