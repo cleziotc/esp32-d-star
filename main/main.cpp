@@ -218,3 +218,223 @@ static void save_wifi_profiles_locked() {
 static void load_wifi_profiles() {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    int32_t count = 0;
+    if (nvs_get_i32(h, "wifi_count", &count) == ESP_OK) {
+        count = std::clamp<int32_t>(count, 0, WIFI_PROFILE_MAX);
+        for (int32_t i = 0; i < count; ++i) {
+            char sk[4] = {'w', 's', static_cast<char>('0' + i), '\0'};
+            char pk[4] = {'w', 'p', static_cast<char>('0' + i), '\0'};
+            auto ssid = nvs_get_string(h, sk, "");
+            auto pass = nvs_get_string(h, pk, "");
+            if (!ssid.empty()) {
+                copy_cstr(g_wifi_profiles[g_wifi_profile_count].ssid, ssid.c_str());
+                copy_cstr(g_wifi_profiles[g_wifi_profile_count].password, pass.c_str());
+                ++g_wifi_profile_count;
+            }
+        }
+    } else {
+        // Migração transparente da v0.1.4 e anteriores.
+        auto ssid = nvs_get_string(h, "wifi_ssid", "");
+        auto pass = nvs_get_string(h, "wifi_pass", "");
+        if (!ssid.empty()) {
+            copy_cstr(g_wifi_profiles[0].ssid, ssid.c_str());
+            copy_cstr(g_wifi_profiles[0].password, pass.c_str());
+            g_wifi_profile_count = 1;
+        }
+    }
+    int64_t sync = 0;
+    if (nvs_get_i64(h, "host_sync", &sync) == ESP_OK) g_host_last_sync = sync;
+    nvs_close(h);
+    if (g_wifi_profile_count) {
+        xSemaphoreTake(g_wifi_mutex, portMAX_DELAY);
+        save_wifi_profiles_locked();
+        xSemaphoreGive(g_wifi_mutex);
+    }
+}
+
+static int upsert_wifi_profile(const char *ssid, const char *pass) {
+    if (!ssid || !ssid[0]) return -1;
+    xSemaphoreTake(g_wifi_mutex, portMAX_DELAY);
+    int found = -1;
+    for (size_t i = 0; i < g_wifi_profile_count; ++i) {
+        if (strcmp(g_wifi_profiles[i].ssid, ssid) == 0) { found = static_cast<int>(i); break; }
+    }
+    if (found < 0) {
+        if (g_wifi_profile_count >= WIFI_PROFILE_MAX) {
+            xSemaphoreGive(g_wifi_mutex);
+            return -2;
+        }
+        found = static_cast<int>(g_wifi_profile_count++);
+    }
+    copy_cstr(g_wifi_profiles[found].ssid, ssid);
+    copy_cstr(g_wifi_profiles[found].password, pass ? pass : "");
+    save_wifi_profiles_locked();
+    xSemaphoreGive(g_wifi_mutex);
+    return found;
+}
+
+static bool delete_wifi_profile(const char *ssid) {
+    if (!ssid || !ssid[0]) return false;
+    xSemaphoreTake(g_wifi_mutex, portMAX_DELAY);
+    size_t idx = WIFI_PROFILE_MAX;
+    for (size_t i = 0; i < g_wifi_profile_count; ++i) {
+        if (strcmp(g_wifi_profiles[i].ssid, ssid) == 0) { idx = i; break; }
+    }
+    if (idx == WIFI_PROFILE_MAX) { xSemaphoreGive(g_wifi_mutex); return false; }
+    for (size_t i = idx; i + 1 < g_wifi_profile_count; ++i) g_wifi_profiles[i] = g_wifi_profiles[i + 1];
+    if (g_wifi_profile_count) --g_wifi_profile_count;
+    g_wifi_profiles[g_wifi_profile_count] = WifiProfile{};
+    save_wifi_profiles_locked();
+    xSemaphoreGive(g_wifi_mutex);
+    return true;
+}
+
+static std::string current_wifi_ssid() {
+    wifi_ap_record_t ap{};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return "";
+    return reinterpret_cast<const char *>(ap.ssid);
+}
+
+static void format_mac(char *out, size_t n, const uint8_t mac[6]) {
+    snprintf(out, n, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static std::string netif_ip(esp_netif_t *netif) {
+    if (!netif) return "0.0.0.0";
+    esp_netif_ip_info_t info{};
+    if (esp_netif_get_ip_info(netif, &info) != ESP_OK) return "0.0.0.0";
+    char ip[16];
+    snprintf(ip, sizeof(ip), IPSTR, IP2STR(&info.ip));
+    return ip;
+}
+
+static std::string station_ip() { return netif_ip(s_sta_netif); }
+static std::string access_point_ip() { return netif_ip(s_ap_netif); }
+
+static bool wifi_station_connected() {
+    return s_wifi_events && (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) != 0;
+}
+
+static std::string preferred_access_ip() {
+    const std::string sta = station_ip();
+    if (wifi_station_connected() && sta != "0.0.0.0") return sta;
+    const std::string ap = access_point_ip();
+    return ap == "0.0.0.0" ? "192.168.4.1" : ap;
+}
+
+static int station_rssi() {
+    wifi_ap_record_t ap{};
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return ap.rssi;
+    return -127;
+}
+
+static void wifi_event_handler(void *, esp_event_base_t base, int32_t id, void *data) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        auto *event = static_cast<ip_event_got_ip_t *>(data);
+        xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
+        esp_netif_sntp_start();
+        add_log("WIFI", "STA conectado a %s: " IPSTR, current_wifi_ssid().c_str(), IP2STR(&event->ip_info.ip));
+    }
+}
+
+static bool copy_wifi_profile(size_t index, WifiProfile &out) {
+    bool ok = false;
+    xSemaphoreTake(g_wifi_mutex, portMAX_DELAY);
+    if (index < g_wifi_profile_count) { out = g_wifi_profiles[index]; ok = true; }
+    xSemaphoreGive(g_wifi_mutex);
+    return ok;
+}
+
+static size_t wifi_profile_count() {
+    xSemaphoreTake(g_wifi_mutex, portMAX_DELAY);
+    const size_t n = g_wifi_profile_count;
+    xSemaphoreGive(g_wifi_mutex);
+    return n;
+}
+
+static void apply_wifi_profile(size_t index) {
+    WifiProfile p{};
+    if (!copy_wifi_profile(index, p)) return;
+    wifi_config_t sta_cfg{};
+    copy_wifi_field(sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), p.ssid);
+    copy_wifi_field(sta_cfg.sta.password, sizeof(sta_cfg.sta.password), p.password);
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    sta_cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    esp_wifi_disconnect();
+    if (esp_wifi_set_config(WIFI_IF_STA, &sta_cfg) == ESP_OK) {
+        add_log("WIFI", "Tentando conectar a %s", p.ssid);
+        esp_wifi_connect();
+    }
+}
+
+static void wifi_manager_task(void *) {
+    size_t next = 0;
+    for (;;) {
+        int requested = g_wifi_requested_index.exchange(-1);
+        const size_t count = wifi_profile_count();
+        if (requested >= 0 && static_cast<size_t>(requested) < count) {
+            apply_wifi_profile(static_cast<size_t>(requested));
+            next = (static_cast<size_t>(requested) + 1) % std::max<size_t>(count, 1);
+            for (int i = 0; i < 20 && !wifi_station_connected(); ++i) vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        if (wifi_station_connected() || count == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            continue;
+        }
+        if (next >= count) next = 0;
+        apply_wifi_profile(next);
+        next = (next + 1) % count;
+        for (int i = 0; i < 20 && !wifi_station_connected(); ++i) vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+static void wifi_init() {
+    s_wifi_events = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+    esp_netif_set_hostname(s_sta_netif, "polar-dstar");
+
+    setenv("TZ", "BRT3", 1);
+    tzset();
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    sntp_cfg.start = false;
+    ESP_ERROR_CHECK(esp_netif_sntp_init(&sntp_cfg));
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    uint8_t mac[6]{};
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    char ap_ssid[32];
+    snprintf(ap_ssid, sizeof(ap_ssid), "Polar-DSTAR-%02X%02X", mac[4], mac[5]);
+
+    wifi_config_t ap_cfg{};
+    copy_wifi_field(ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), ap_ssid);
+    copy_wifi_field(ap_cfg.ap.password, sizeof(ap_cfg.ap.password), "polar-dstar");
+    ap_cfg.ap.ssid_len = strlen(ap_ssid);
+    ap_cfg.ap.channel = 6;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_cfg.ap.pmf_cfg.required = false;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    xTaskCreate(&wifi_manager_task, "wifi_mgr", 4096, nullptr, 4, nullptr);
+
+    add_log("WIFI", "AP de manutenção: %s / senha polar-dstar / 192.168.4.1", ap_ssid);
+    if (!wifi_profile_count()) add_log("WIFI", "Nenhuma rede STA salva; use Redes > Pesquisar redes");
+}
+
+static HostKind host_kind_from_name(const char *name) {
+    if (strncmp(name, "XLX", 3) == 0) return HostKind::XLX;
+    if (strncmp(name, "REF", 3) == 0) return HostKind::REF;
+    if (strncmp(name, "XRF", 3) == 0) return HostKind::XRF;
+    return HostKind::DCS;
