@@ -75,16 +75,12 @@ jobs:
           SHA256="$(sha256sum dist/polar_dstar_esp32.bin | awk '{print $1}')"
           SIZE="$(stat -c%s dist/polar_dstar_esp32.bin)"
 
-          cat > dist/latest.json <<EOF
-          {
-            "version": "${VERSION}",
-            "target": "esp32s3",
-            "idf": "6.1",
-            "size": ${SIZE},
-            "sha256": "${SHA256}",
-            "firmware": "https://github.com/cleziotc/esp32-d-star/releases/latest/download/polar_dstar_esp32.bin"
-          }
-          EOF
+          python3 tools/make_update_manifest.py \
+            --version "$VERSION" \
+            --size "$SIZE" \
+            --sha256 "$SHA256" \
+            --output dist/latest.json \
+            --notes-output dist/release-notes.md
 
       - name: Publish GitHub Release
         if: steps.release_check.outputs.exists != 'true'
@@ -94,7 +90,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Polar D-Star ${{ steps.version.outputs.tag }}
           make_latest: true
-          generate_release_notes: true
+          body_path: dist/release-notes.md
           files: |
             dist/polar_dstar_esp32.bin
             dist/bootloader.bin
@@ -102,3 +98,22 @@ jobs:
             dist/ota_data_initial.bin
             dist/SHA256SUMS.txt
             dist/latest.json
+
+      - name: Publish online manifest
+        if: steps.release_check.outputs.exists != 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p update
+          cp dist/latest.json update/latest.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update/latest.json
+          if git diff --cached --quiet; then
+            echo "Online manifest already current."
+            exit 0
+          fi
+          git commit -m "Update online manifest for v${VERSION}"
+          git push origin HEAD:main
