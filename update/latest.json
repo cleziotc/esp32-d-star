@@ -1,12 +1,12 @@
 {
-  "version": "0.1.8",
-  "name": "Polar D-Star v0.1.8",
+  "version": "0.1.9",
+  "name": "Polar D-Star v0.1.9",
   "target": "esp32s3",
   "idf": "6.1",
-  "published_at": "2026-10-04T04:39:54Z",
-  "size": 1107728,
-  "sha256": "5a2a82f69fa7f46044cb2880d2f196db09ccfbe49799b8e22a38d863dd77ebf7",
-  "firmware": "https://github.com/cleziotc/esp32-d-star/releases/download/v0.1.8/polar_dstar_esp32.bin",
-  "release_url": "https://github.com/cleziotc/esp32-d-star/releases/tag/v0.1.8",
-  "notes": "Adiciona verificação de atualização online diretamente no GitHub.\nAdiciona instalação OTA online sem baixar o arquivo .bin no computador.\nUsa HTTPS com o bundle de certificados do ESP-IDF.\nDownload e gravação ocorrem em tarefa separada para não bloquear o servidor web.\nExibe progresso da atualização no dashboard.\nValida tamanho recebido e a imagem de aplicação antes de trocar a partição de boot.\nMantém a atualização manual por .bin como alternativa de recuperação."
+  "published_at": "2026-10-04T05:17:14Z",
+  "size": 1118864,
+  "sha256": "93a07c36e590460a4c1bf4a292e61ef54890d392946805a7680ba5f8cc07ae1b",
+  "firmware": "https://github.com/cleziotc/esp32-d-star/releases/download/v0.1.9/polar_dstar_esp32.bin",
+  "release_url": "https://github.com/cleziotc/esp32-d-star/releases/tag/v0.1.9",
+  "notes": "Corrige a consulta online ao GitHub usando um manifesto direto em `raw.githubusercontent.com`, evitando a cadeia de redirecionamentos usada para localizar `latest.json` nas Releases.\nAguarda a sincronização do relógio via NTP antes de iniciar TLS/HTTPS e informa claramente quando o relógio ainda não está válido.\nUsa o bundle completo de certificados raiz do ESP-IDF e registra também o `errno` em falhas HTTPS para facilitar diagnóstico.\nA página **Atualização de Firmware** passa a exibir os detalhes da release instalada e da última release publicada.\nMostra versão, build, ESP-IDF, alvo, partição ativa, hashes, tamanho, data de publicação e notas da release.\nA consulta ao GitHub é disparada automaticamente na primeira abertura da página de atualização.\nO workflow de release publica automaticamente um manifesto leve em `update/latest.json` para as próximas atualizações OTA.\nMantém a atualização manual por arquivo `.bin` como caminho de recuperação."
 }
