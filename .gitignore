@@ -1,0 +1,8 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+main/web_assets.cpp
+*.bin
+*.elf
+*.map
