@@ -1,11 +1,11 @@
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let statusCache={}, configCache={};
-let currentReflectorType="XLX", hostPollTimer=null;
+let currentReflectorType="XLX", hostPollTimer=null, updatePollTimer=null;
 function applyVersion(v){const label='v'+v;const d=$('#dashFirmwareVersion');if(d)d.textContent=label;const o=$('#otaFirmwareVersion');if(o)o.textContent=label;const f=$('#footerVersion');if(f)f.textContent='Polar D-Star ESP32 '+label;}
 function setLamp(id,on,kind){const el=$(id);if(!el)return;el.className='lamp '+(on?(kind||'rx'):'off');}
 function toast(msg,error=false){const t=$('#toast');t.textContent=msg;t.className='toast show'+(error?' error':'');clearTimeout(window.__toast);window.__toast=setTimeout(()=>t.className='toast',2800)}
 async function api(path,opt={}){const r=await fetch(path,{cache:'no-store',...opt});let j={};try{j=await r.json()}catch{}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
-function showPage(name){$$('.page').forEach(p=>p.classList.remove('active'));const p=$('#page-'+name)||$('#page-dashboard');p.classList.add('active');$$('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.page===name));$('#mainNav').classList.remove('open');history.replaceState(null,'','#'+name);if(name==='logs')loadLogs();if(name==='system')loadSystem();if(name==='network'){loadWifi();loadHostsStatus();loadReflectors(currentReflectorType,$('#reflectorSelect')?.value||configCache.reflector)}if(name==='radio')drawChart()}
+function showPage(name){$$('.page').forEach(p=>p.classList.remove('active'));const p=$('#page-'+name)||$('#page-dashboard');p.classList.add('active');$$('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.page===name));$('#mainNav').classList.remove('open');history.replaceState(null,'','#'+name);if(name==='logs')loadLogs();if(name==='system')loadSystem();if(name==='network'){loadWifi();loadHostsStatus();loadReflectors(currentReflectorType,$('#reflectorSelect')?.value||configCache.reflector)}if(name==='radio')drawChart();if(name==='update')loadOnlineUpdate()}
 $$('[data-page]').forEach(b=>b.addEventListener('click',()=>showPage(b.dataset.page)));$('#menuBtn').onclick=()=>$('#mainNav').classList.toggle('open');
 function fmtUptime(s){s=Number(s||0);const d=Math.floor(s/86400);s%=86400;const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);return (d?d+'d ':'')+h+'h '+m+'m'}
 function fmtHz(hz){return (Number(hz||0)/1e6).toFixed(6)+' MHz'}
@@ -32,6 +32,45 @@ async function loadLogs(){try{const d=await api('/api/logs');$('#logBox').textCo
 $('#refreshLogs').onclick=loadLogs;
 $('#rebootBtn').onclick=async()=>{if(!confirm('Reiniciar o Polar D-Star agora?'))return;try{await api('/api/reboot',{method:'POST'});toast('Reiniciando...')}catch(e){toast(e.message,true)}};
 $('#factoryBtn').onclick=async()=>{if(!confirm('Apagar Wi-Fi e todas as configurações? Esta ação reinicia o equipamento.'))return;try{await api('/api/factory-reset',{method:'POST'});toast('Configurações apagadas. Reiniciando...')}catch(e){toast(e.message,true)}};
+function renderOnlineUpdate(u){
+  const latest=$('#onlineUpdateVersion'),state=$('#onlineUpdateState'),msg=$('#onlineUpdateMsg');
+  const check=$('#checkUpdateBtn'),install=$('#onlineUpdateBtn'),bar=$('#onlineUpdateProgress');
+  if(!latest||!state||!check||!install||!bar)return;
+  latest.textContent=u.latest?('v'+u.latest):'—';
+  state.textContent=u.message||'Ainda não verificado.';
+  const progress=Math.max(0,Math.min(100,Number(u.progress||0)));
+  bar.style.width=progress+'%';
+  check.disabled=!!(u.checking||u.installing);
+  install.disabled=!u.available||u.checking||u.installing;
+  check.textContent=u.checking?'Verificando...':'Verificar agora';
+  install.textContent=u.installing?('Atualizando '+progress+'%'):'Atualizar agora';
+  if(u.installing)msg.textContent='Baixando e gravando o firmware. Não desligue o equipamento.';
+  else if(u.available)msg.textContent='Nova versão v'+u.latest+' disponível para instalação direta.';
+  else if(u.checked)msg.textContent='Nenhuma atualização pendente.';
+  else msg.textContent='';
+  clearTimeout(updatePollTimer);
+  if(u.checking||u.installing)updatePollTimer=setTimeout(loadOnlineUpdate,1000);
+}
+async function loadOnlineUpdate(){
+  try{const u=await api('/api/update');renderOnlineUpdate(u)}
+  catch(e){const state=$('#onlineUpdateState');if(state)state.textContent='Não foi possível consultar o estado da atualização.'}
+}
+$('#checkUpdateBtn').onclick=async()=>{
+  try{
+    await api('/api/update/check',{method:'POST'});
+    toast('Consultando a última versão no GitHub...');
+    clearTimeout(updatePollTimer);updatePollTimer=setTimeout(loadOnlineUpdate,500)
+  }catch(e){toast(e.message,true)}
+};
+$('#onlineUpdateBtn').onclick=async()=>{
+  const version=$('#onlineUpdateVersion').textContent||'nova versão';
+  if(!confirm('Instalar '+version+' diretamente do GitHub? O equipamento será reiniciado.'))return;
+  try{
+    await api('/api/update/install',{method:'POST'});
+    toast('Atualização online iniciada');
+    clearTimeout(updatePollTimer);updatePollTimer=setTimeout(loadOnlineUpdate,500)
+  }catch(e){toast(e.message,true)}
+};
 $('#otaBtn').onclick=async()=>{const file=$('#otaFile').files[0];if(!file){toast('Selecione o arquivo .bin',true);return}if(!confirm(`Atualizar com ${file.name} (${Math.round(file.size/1024)} KB)?`))return;const btn=$('#otaBtn');btn.disabled=true;$('#otaMsg').textContent='Enviando firmware...';$('#otaProgress').style.width='15%';try{const r=await fetch('/api/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});$('#otaProgress').style.width='90%';const j=await r.json();if(!r.ok)throw new Error(j.error||'Falha na atualização');$('#otaProgress').style.width='100%';$('#otaMsg').textContent='Firmware gravado. Reiniciando...';toast('OTA concluída')}catch(e){$('#otaMsg').textContent=e.message;toast(e.message,true);btn.disabled=false;$('#otaProgress').style.width='0'}};
 function drawChart(){const c=$('#signalChart');if(!c)return;const dpr=devicePixelRatio||1,rect=c.getBoundingClientRect();c.width=Math.max(320,rect.width*dpr);c.height=Math.max(180,rect.height*dpr);const x=c.getContext('2d');x.scale(dpr,dpr);const w=rect.width,h=rect.height;x.clearRect(0,0,w,h);x.strokeStyle='#17394b';x.lineWidth=1;for(let i=1;i<6;i++){x.beginPath();x.moveTo(0,h*i/6);x.lineTo(w,h*i/6);x.stroke()}for(let i=1;i<12;i++){x.beginPath();x.moveTo(w*i/12,0);x.lineTo(w*i/12,h);x.stroke()}x.strokeStyle='#1de965';x.lineWidth=2;x.beginPath();for(let i=0;i<=120;i++){const px=w*i/120;const py=h*.72+Math.sin(i*.55)*3+Math.sin(i*.11)*5;if(i===0)x.moveTo(px,py);else x.lineTo(px,py)}x.stroke();x.fillStyle='#7596a8';x.font='12px system-ui';x.fillText('SIMULAÇÃO VISUAL — dados RF entram na v0.2',12,20)}
 window.addEventListener('resize',()=>{if($('#page-radio').classList.contains('active'))drawChart()});
