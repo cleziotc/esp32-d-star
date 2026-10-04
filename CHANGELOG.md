@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.9
+- Corrige a consulta online ao GitHub usando um manifesto direto em `raw.githubusercontent.com`, evitando a cadeia de redirecionamentos usada para localizar `latest.json` nas Releases.
+- Aguarda a sincronização do relógio via NTP antes de iniciar TLS/HTTPS e informa claramente quando o relógio ainda não está válido.
+- Usa o bundle completo de certificados raiz do ESP-IDF e registra também o `errno` em falhas HTTPS para facilitar diagnóstico.
+- A página **Atualização de Firmware** passa a exibir os detalhes da release instalada e da última release publicada.
+- Mostra versão, build, ESP-IDF, alvo, partição ativa, hashes, tamanho, data de publicação e notas da release.
+- A consulta ao GitHub é disparada automaticamente na primeira abertura da página de atualização.
+- O workflow de release publica automaticamente um manifesto leve em `update/latest.json` para as próximas atualizações OTA.
+- Mantém a atualização manual por arquivo `.bin` como caminho de recuperação.
+
 ## v0.1.8
 - Adiciona verificação de atualização online diretamente no GitHub.
 - Adiciona instalação OTA online sem baixar o arquivo `.bin` no computador.
