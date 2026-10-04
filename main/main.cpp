@@ -724,6 +724,9 @@ static void host_sync_task(void *) {
 }
 
 
+static esp_err_t send_json(httpd_req_t *req, cJSON *root, int status = 200);
+static esp_err_t send_error(httpd_req_t *req, int status, const char *message);
+
 struct ManifestHttpBuffer {
     std::string body;
     bool overflow{false};
@@ -1048,7 +1051,7 @@ static esp_err_t api_update_install(httpd_req_t *req) {
     return send_json(req, root, 202);
 }
 
-static esp_err_t send_json(httpd_req_t *req, cJSON *root, int status = 200) {
+static esp_err_t send_json(httpd_req_t *req, cJSON *root, int status) {
     char status_line[32];
     snprintf(status_line, sizeof(status_line), "%d %s", status,
              status == 200 ? "OK" : status == 202 ? "Accepted" : status == 400 ? "Bad Request" : "Error");
