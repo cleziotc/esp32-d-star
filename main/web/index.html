@@ -142,10 +142,31 @@
     </section>
 
     <section class="page" id="page-update">
-      <div class="page-title"><div><h1>◆ Atualização de Firmware</h1><p>Atualize o hotspot pelo ar (OTA).</p></div></div>
+      <div class="page-title"><div><h1>◆ Atualização de Firmware</h1><p>Atualize o hotspot diretamente pelo GitHub ou envie um firmware manualmente.</p></div></div>
       <div class="grid two-col">
-        <article class="card"><h2>Versão atual</h2><div class="firmware-version">Polar D-Star <b id="otaFirmwareVersion">--</b></div><div id="buildInfo" class="hint">--</div></article>
-        <article class="card form-card"><h2>Nova versão</h2><div class="dropzone" id="dropzone"><span>☁</span><b>Selecione um firmware .bin</b><input type="file" id="otaFile" accept=".bin,application/octet-stream"></div><button class="primary" id="otaBtn" type="button">Iniciar atualização</button><div class="progress"><i id="otaProgress"></i></div><p id="otaMsg" class="hint"></p></article>
+        <article class="card">
+          <h2>Versão atual</h2>
+          <div class="firmware-version">Polar D-Star <b id="otaFirmwareVersion">--</b></div>
+          <div id="buildInfo" class="hint">--</div>
+        </article>
+        <article class="card form-card">
+          <h2>Atualização online</h2>
+          <div class="update-online-row"><span>Última versão no GitHub</span><b id="onlineUpdateVersion">—</b></div>
+          <p id="onlineUpdateState" class="hint">Ainda não verificado.</p>
+          <div class="reflector-actions">
+            <button class="ghost" id="checkUpdateBtn" type="button">Verificar agora</button>
+            <button class="primary" id="onlineUpdateBtn" type="button" disabled>Atualizar agora</button>
+          </div>
+          <div class="progress"><i id="onlineUpdateProgress"></i></div>
+          <p id="onlineUpdateMsg" class="hint"></p>
+        </article>
+        <article class="card form-card span-2">
+          <h2>Atualização manual</h2>
+          <p class="hint">Use esta opção como alternativa de recuperação ou para instalar um arquivo <b>.bin</b> específico.</p>
+          <div class="dropzone" id="dropzone"><span>☁</span><b>Selecione um firmware .bin</b><input type="file" id="otaFile" accept=".bin,application/octet-stream"></div>
+          <button class="primary" id="otaBtn" type="button">Iniciar atualização manual</button>
+          <div class="progress"><i id="otaProgress"></i></div><p id="otaMsg" class="hint"></p>
+        </article>
       </div>
     </section>
   </main>
