@@ -658,3 +658,223 @@ static bool daily_host_sync_due() {
     time_t now = time(nullptr);
     if (now <= 1700000000) return false;
     struct tm today{}, last{};
+    localtime_r(&now, &today);
+    if (g_host_last_sync <= 1700000000) return today.tm_hour >= 3;
+    time_t last_t = static_cast<time_t>(g_host_last_sync);
+    localtime_r(&last_t, &last);
+    const bool same_day = today.tm_year == last.tm_year && today.tm_yday == last.tm_yday;
+    if (!same_day) return today.tm_hour >= 3;
+    return today.tm_hour >= 3 && last.tm_hour < 3;
+}
+
+static void host_sync_task(void *) {
+    bool first_online_sync = true;
+    uint64_t last_attempt_ms = 0;
+    for (;;) {
+        if (!wifi_station_connected()) {
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+        if (first_online_sync) {
+            for (int i = 0; i < 20 && time(nullptr) <= 1700000000; ++i) vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        bool requested = g_host_sync_requested.exchange(false);
+        bool empty = false;
+        xSemaphoreTake(g_hosts_mutex, portMAX_DELAY);
+        empty = g_host_count == 0;
+        xSemaphoreGive(g_hosts_mutex);
+        const bool throttle_ok = last_attempt_ms == 0 || uptime_ms() - last_attempt_ms >= 300000ULL;
+        const bool retry_due = empty && throttle_ok;
+        const bool daily_due = daily_host_sync_due() && throttle_ok;
+        if (!g_host_syncing && (requested || retry_due || daily_due)) {
+            last_attempt_ms = uptime_ms();
+            download_host_list();
+            first_online_sync = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+static esp_err_t send_json(httpd_req_t *req, cJSON *root, int status = 200) {
+    char status_line[32];
+    snprintf(status_line, sizeof(status_line), "%d %s", status,
+             status == 200 ? "OK" : status == 202 ? "Accepted" : status == 400 ? "Bad Request" : "Error");
+    httpd_resp_set_status(req, status_line);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    char *text = cJSON_PrintUnformatted(root);
+    esp_err_t err = httpd_resp_sendstr(req, text ? text : "{}");
+    if (text) free(text);
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t send_error(httpd_req_t *req, int status, const char *message) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", false);
+    cJSON_AddStringToObject(root, "error", message);
+    return send_json(req, root, status);
+}
+
+static std::string recv_body(httpd_req_t *req, size_t max_len = 4096) {
+    if (req->content_len <= 0 || static_cast<size_t>(req->content_len) > max_len) return "";
+    std::string body(req->content_len, '\0');
+    int received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body.data() + received, req->content_len - received);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0) return "";
+        received += r;
+    }
+    return body;
+}
+
+static esp_err_t static_file(httpd_req_t *req, const uint8_t *data, size_t len, const char *type) {
+    httpd_resp_set_type(req, type);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, reinterpret_cast<const char *>(data), static_cast<ssize_t>(len));
+}
+
+static esp_err_t root_handler(httpd_req_t *req) { return static_file(req, kIndexHtml, kIndexHtmlLen, "text/html; charset=utf-8"); }
+static esp_err_t css_handler(httpd_req_t *req) { return static_file(req, kStyleCss, kStyleCssLen, "text/css; charset=utf-8"); }
+static esp_err_t js_handler(httpd_req_t *req) { return static_file(req, kAppJs, kAppJsLen, "application/javascript; charset=utf-8"); }
+
+static esp_err_t api_status(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    xSemaphoreTake(g_cfg_mutex, portMAX_DELAY);
+    cJSON_AddStringToObject(root, "callsign", g_cfg.callsign);
+    cJSON_AddStringToObject(root, "module", g_cfg.module);
+    cJSON_AddNumberToObject(root, "rx_hz", static_cast<double>(g_cfg.rx_hz));
+    cJSON_AddNumberToObject(root, "tx_hz", static_cast<double>(g_cfg.tx_hz));
+    cJSON_AddStringToObject(root, "reflector", g_cfg.reflector);
+    cJSON_AddStringToObject(root, "reflector_type", g_cfg.reflector_type);
+    cJSON_AddStringToObject(root, "reflector_module", g_cfg.reflector_module);
+    xSemaphoreGive(g_cfg_mutex);
+    cJSON_AddBoolToObject(root, "mmdvm_online", false);
+    cJSON_AddStringToObject(root, "mmdvm_state", "Aguardando v0.2");
+    cJSON_AddBoolToObject(root, "dstar_active", false);
+    cJSON_AddBoolToObject(root, "tx_active", false);
+    cJSON_AddBoolToObject(root, "rx_active", false);
+    cJSON_AddBoolToObject(root, "reflector_connected", false);
+    cJSON_AddBoolToObject(root, "wifi_connected", wifi_station_connected());
+    cJSON_AddStringToObject(root, "ip", preferred_access_ip().c_str());
+    cJSON_AddStringToObject(root, "sta_ip", station_ip().c_str());
+    cJSON_AddStringToObject(root, "ap_ip", access_point_ip().c_str());
+    cJSON_AddNumberToObject(root, "rssi", station_rssi());
+    cJSON_AddNumberToObject(root, "uptime_s", uptime_ms() / 1000ULL);
+    cJSON_AddStringToObject(root, "version", POLAR_DSTAR_VERSION);
+    return send_json(req, root);
+}
+
+static esp_err_t api_config_get(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    xSemaphoreTake(g_cfg_mutex, portMAX_DELAY);
+    cJSON_AddStringToObject(root, "callsign", g_cfg.callsign);
+    cJSON_AddStringToObject(root, "module", g_cfg.module);
+    cJSON_AddStringToObject(root, "location", g_cfg.location);
+    cJSON_AddNumberToObject(root, "rx_hz", static_cast<double>(g_cfg.rx_hz));
+    cJSON_AddNumberToObject(root, "tx_hz", static_cast<double>(g_cfg.tx_hz));
+    cJSON_AddNumberToObject(root, "rx_offset_hz", g_cfg.rx_offset_hz);
+    cJSON_AddNumberToObject(root, "tx_offset_hz", g_cfg.tx_offset_hz);
+    cJSON_AddNumberToObject(root, "tx_level", g_cfg.tx_level);
+    cJSON_AddNumberToObject(root, "rx_level", g_cfg.rx_level);
+    cJSON_AddStringToObject(root, "reflector", g_cfg.reflector);
+    cJSON_AddStringToObject(root, "reflector_type", g_cfg.reflector_type);
+    cJSON_AddStringToObject(root, "reflector_module", g_cfg.reflector_module);
+    xSemaphoreGive(g_cfg_mutex);
+    return send_json(req, root);
+}
+
+static void json_copy_string(cJSON *root, const char *key, char *dst, size_t n) {
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsString(it) && it->valuestring) snprintf(dst, n, "%s", it->valuestring);
+}
+static void json_copy_i32(cJSON *root, const char *key, int32_t &dst) {
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(it)) dst = static_cast<int32_t>(it->valuedouble);
+}
+static void json_copy_i64(cJSON *root, const char *key, int64_t &dst) {
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(it)) dst = static_cast<int64_t>(it->valuedouble);
+}
+
+static esp_err_t api_config_post(httpd_req_t *req) {
+    std::string body = recv_body(req);
+    if (body.empty()) return send_error(req, 400, "JSON ausente ou grande demais");
+    cJSON *json = cJSON_Parse(body.c_str());
+    if (!json) return send_error(req, 400, "JSON inválido");
+
+    xSemaphoreTake(g_cfg_mutex, portMAX_DELAY);
+    json_copy_string(json, "callsign", g_cfg.callsign, sizeof(g_cfg.callsign));
+    json_copy_string(json, "module", g_cfg.module, sizeof(g_cfg.module));
+    json_copy_string(json, "location", g_cfg.location, sizeof(g_cfg.location));
+    json_copy_i64(json, "rx_hz", g_cfg.rx_hz);
+    json_copy_i64(json, "tx_hz", g_cfg.tx_hz);
+    json_copy_i32(json, "rx_offset_hz", g_cfg.rx_offset_hz);
+    json_copy_i32(json, "tx_offset_hz", g_cfg.tx_offset_hz);
+    json_copy_i32(json, "tx_level", g_cfg.tx_level);
+    json_copy_i32(json, "rx_level", g_cfg.rx_level);
+    json_copy_string(json, "reflector", g_cfg.reflector, sizeof(g_cfg.reflector));
+    json_copy_string(json, "reflector_type", g_cfg.reflector_type, sizeof(g_cfg.reflector_type));
+    json_copy_string(json, "reflector_module", g_cfg.reflector_module, sizeof(g_cfg.reflector_module));
+    g_cfg.tx_level = std::clamp<int32_t>(g_cfg.tx_level, 0, 100);
+    g_cfg.rx_level = std::clamp<int32_t>(g_cfg.rx_level, 0, 100);
+    esp_err_t err = save_config_locked();
+    xSemaphoreGive(g_cfg_mutex);
+    cJSON_Delete(json);
+    if (err != ESP_OK) return send_error(req, 500, esp_err_to_name(err));
+    add_log("CFG", "Configuração D-Star salva");
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddBoolToObject(out, "ok", true);
+    return send_json(req, out);
+}
+
+static esp_err_t api_wifi_get(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    const std::string current = current_wifi_ssid();
+    cJSON_AddBoolToObject(root, "configured", wifi_profile_count() > 0);
+    cJSON_AddBoolToObject(root, "connected", wifi_station_connected());
+    cJSON_AddStringToObject(root, "ssid", current.c_str());
+    cJSON_AddStringToObject(root, "ip", station_ip().c_str());
+    cJSON_AddNumberToObject(root, "rssi", station_rssi());
+    cJSON_AddStringToObject(root, "ap_ip", access_point_ip().c_str());
+    cJSON *profiles = cJSON_AddArrayToObject(root, "profiles");
+    xSemaphoreTake(g_wifi_mutex, portMAX_DELAY);
+    for (size_t i = 0; i < g_wifi_profile_count; ++i) {
+        cJSON *it = cJSON_CreateObject();
+        cJSON_AddNumberToObject(it, "index", static_cast<double>(i));
+        cJSON_AddStringToObject(it, "ssid", g_wifi_profiles[i].ssid);
+        cJSON_AddBoolToObject(it, "connected", wifi_station_connected() && current == g_wifi_profiles[i].ssid);
+        cJSON_AddItemToArray(profiles, it);
+    }
+    xSemaphoreGive(g_wifi_mutex);
+    cJSON_AddNumberToObject(root, "max_profiles", WIFI_PROFILE_MAX);
+    return send_json(req, root);
+}
+
+static esp_err_t api_wifi_scan(httpd_req_t *req) {
+    wifi_scan_config_t scan{};
+    esp_err_t err = esp_wifi_scan_start(&scan, true);
+    if (err != ESP_OK) return send_error(req, 500, esp_err_to_name(err));
+    uint16_t total = 0;
+    esp_wifi_scan_get_ap_num(&total);
+    uint16_t n = std::min<uint16_t>(total, 30);
+    wifi_ap_record_t *records = n ? static_cast<wifi_ap_record_t *>(calloc(n, sizeof(wifi_ap_record_t))) : nullptr;
+    if (n && !records) return send_error(req, 500, "Sem memória para scan Wi-Fi");
+    if (n) esp_wifi_scan_get_ap_records(&n, records);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *items = cJSON_AddArrayToObject(root, "items");
+    for (uint16_t i = 0; i < n; ++i) {
+        const char *ssid = reinterpret_cast<const char *>(records[i].ssid);
+        if (!ssid || !ssid[0]) continue;
+        bool duplicate = false;
+        for (uint16_t j = 0; j < i; ++j) {
+            if (strcmp(reinterpret_cast<const char *>(records[j].ssid), ssid) == 0) { duplicate = true; break; }
+        }
+        if (duplicate) continue;
+        cJSON *it = cJSON_CreateObject();
+        cJSON_AddStringToObject(it, "ssid", ssid);
+        cJSON_AddNumberToObject(it, "rssi", records[i].rssi);
+        cJSON_AddNumberToObject(it, "channel", records[i].primary);
+        cJSON_AddBoolToObject(it, "open", records[i].authmode == WIFI_AUTH_OPEN);
+        cJSON_AddItemToArray(items, it);
