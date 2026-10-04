@@ -19,6 +19,8 @@
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_http_client.h"
+#include "esp_https_ota.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -71,6 +73,32 @@ static std::atomic<bool> g_host_sync_requested{false};
 static std::atomic<bool> g_host_syncing{false};
 static int64_t g_host_last_sync = 0;
 
+static constexpr const char *UPDATE_MANIFEST_URL =
+    "https://github.com/cleziotc/esp32-d-star/releases/latest/download/latest.json";
+
+struct OnlineUpdateState {
+    bool checked{false};
+    bool available{false};
+    bool checking{false};
+    bool installing{false};
+    int progress{0};
+    int64_t size{0};
+    char version[16]{};
+    char firmware_url[384]{};
+    char sha256[65]{};
+    char message[128]{"Ainda não verificado"};
+};
+
+struct OnlineUpdateManifest {
+    char version[16]{};
+    char firmware_url[384]{};
+    char sha256[65]{};
+    int64_t size{0};
+};
+
+static OnlineUpdateState g_update;
+static SemaphoreHandle_t g_update_mutex = nullptr;
+static std::atomic<bool> g_online_ota_active{false};
 
 struct AppConfig {
     char callsign[16] = "PP5CI";
@@ -671,7 +699,7 @@ static void host_sync_task(void *) {
     bool first_online_sync = true;
     uint64_t last_attempt_ms = 0;
     for (;;) {
-        if (!wifi_station_connected()) {
+        if (!wifi_station_connected() || g_online_ota_active.load()) {
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
@@ -693,6 +721,331 @@ static void host_sync_task(void *) {
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
+}
+
+
+struct ManifestHttpBuffer {
+    std::string body;
+    bool overflow{false};
+};
+
+static esp_err_t manifest_http_event(esp_http_client_event_t *evt) {
+    auto *buffer = static_cast<ManifestHttpBuffer *>(evt->user_data);
+    if (!buffer) return ESP_OK;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data && evt->data_len > 0) {
+        if (buffer->body.size() + static_cast<size_t>(evt->data_len) > 4096) {
+            buffer->overflow = true;
+            return ESP_OK;
+        }
+        buffer->body.append(static_cast<const char *>(evt->data), static_cast<size_t>(evt->data_len));
+    }
+    return ESP_OK;
+}
+
+static int compare_versions(const char *a, const char *b) {
+    int av[3]{}, bv[3]{};
+    if (sscanf(a ? a : "", "%d.%d.%d", &av[0], &av[1], &av[2]) != 3 ||
+        sscanf(b ? b : "", "%d.%d.%d", &bv[0], &bv[1], &bv[2]) != 3) {
+        return strcmp(a ? a : "", b ? b : "");
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (av[i] < bv[i]) return -1;
+        if (av[i] > bv[i]) return 1;
+    }
+    return 0;
+}
+
+static bool fetch_online_manifest(OnlineUpdateManifest &out, char *error, size_t error_len) {
+    ManifestHttpBuffer buffer;
+    buffer.body.reserve(1024);
+
+    esp_http_client_config_t cfg{};
+    cfg.url = UPDATE_MANIFEST_URL;
+    cfg.event_handler = manifest_http_event;
+    cfg.user_data = &buffer;
+    cfg.timeout_ms = 25000;
+    cfg.max_redirection_count = 8;
+    cfg.keep_alive_enable = false;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.user_agent = "Polar-DStar-ESP32/online-update";
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        snprintf(error, error_len, "Falha ao criar cliente HTTPS");
+        return false;
+    }
+    esp_http_client_set_header(client, "Connection", "close");
+    esp_err_t err = esp_http_client_perform(client);
+    const int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        snprintf(error, error_len, "Falha HTTPS: %s", esp_err_to_name(err));
+        return false;
+    }
+    if (status != 200) {
+        snprintf(error, error_len, "GitHub respondeu HTTP %d", status);
+        return false;
+    }
+    if (buffer.overflow || buffer.body.empty()) {
+        snprintf(error, error_len, "Manifesto de atualização inválido");
+        return false;
+    }
+
+    cJSON *json = cJSON_Parse(buffer.body.c_str());
+    if (!json) {
+        snprintf(error, error_len, "latest.json inválido");
+        return false;
+    }
+    cJSON *version = cJSON_GetObjectItemCaseSensitive(json, "version");
+    cJSON *firmware = cJSON_GetObjectItemCaseSensitive(json, "firmware");
+    cJSON *sha256 = cJSON_GetObjectItemCaseSensitive(json, "sha256");
+    cJSON *size = cJSON_GetObjectItemCaseSensitive(json, "size");
+
+    const bool valid = cJSON_IsString(version) && version->valuestring &&
+                       cJSON_IsString(firmware) && firmware->valuestring &&
+                       cJSON_IsString(sha256) && sha256->valuestring &&
+                       strlen(sha256->valuestring) == 64 &&
+                       cJSON_IsNumber(size) && size->valuedouble > 0;
+    if (!valid) {
+        cJSON_Delete(json);
+        snprintf(error, error_len, "Campos ausentes em latest.json");
+        return false;
+    }
+
+    copy_cstr(out.version, version->valuestring);
+    copy_cstr(out.firmware_url, firmware->valuestring);
+    copy_cstr(out.sha256, sha256->valuestring);
+    out.size = static_cast<int64_t>(size->valuedouble);
+    cJSON_Delete(json);
+
+    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+    if (!target || out.size > static_cast<int64_t>(target->size)) {
+        snprintf(error, error_len, "Firmware online não cabe na partição OTA");
+        return false;
+    }
+    return true;
+}
+
+static void update_set_failure(const char *message) {
+    xSemaphoreTake(g_update_mutex, portMAX_DELAY);
+    g_update.checking = false;
+    g_update.installing = false;
+    g_update.progress = 0;
+    snprintf(g_update.message, sizeof(g_update.message), "%s", message ? message : "Falha na atualização");
+    xSemaphoreGive(g_update_mutex);
+    g_online_ota_active = false;
+}
+
+static void online_update_check_task(void *) {
+    OnlineUpdateManifest manifest{};
+    char error[128]{};
+    const bool ok = fetch_online_manifest(manifest, error, sizeof(error));
+
+    xSemaphoreTake(g_update_mutex, portMAX_DELAY);
+    g_update.checking = false;
+    if (!ok) {
+        g_update.checked = false;
+        g_update.available = false;
+        g_update.progress = 0;
+        snprintf(g_update.message, sizeof(g_update.message), "%s", error);
+    } else {
+        g_update.checked = true;
+        g_update.progress = 0;
+        g_update.size = manifest.size;
+        copy_cstr(g_update.version, manifest.version);
+        copy_cstr(g_update.firmware_url, manifest.firmware_url);
+        copy_cstr(g_update.sha256, manifest.sha256);
+        const int cmp = compare_versions(POLAR_DSTAR_VERSION, manifest.version);
+        g_update.available = cmp < 0;
+        if (cmp < 0) {
+            snprintf(g_update.message, sizeof(g_update.message), "Nova versão v%s disponível", manifest.version);
+        } else if (cmp == 0) {
+            snprintf(g_update.message, sizeof(g_update.message), "Firmware já está atualizado");
+        } else {
+            snprintf(g_update.message, sizeof(g_update.message), "Versão instalada é mais nova que a publicada");
+        }
+    }
+    xSemaphoreGive(g_update_mutex);
+    if (ok) add_log("UPDATE", "GitHub: v%s (%s)", manifest.version,
+                    compare_versions(POLAR_DSTAR_VERSION, manifest.version) < 0 ? "nova versão" : "atual");
+    else add_log("UPDATE", "%s", error);
+    vTaskDelete(nullptr);
+}
+
+static void online_update_install_task(void *) {
+    OnlineUpdateManifest manifest{};
+    xSemaphoreTake(g_update_mutex, portMAX_DELAY);
+    copy_cstr(manifest.version, g_update.version);
+    copy_cstr(manifest.firmware_url, g_update.firmware_url);
+    copy_cstr(manifest.sha256, g_update.sha256);
+    manifest.size = g_update.size;
+    xSemaphoreGive(g_update_mutex);
+
+    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+    if (!target) {
+        update_set_failure("Nenhuma partição OTA disponível");
+        add_log("UPDATE", "Nenhuma partição OTA disponível");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    add_log("UPDATE", "Baixando v%s diretamente do GitHub", manifest.version);
+    esp_http_client_config_t http_cfg{};
+    http_cfg.url = manifest.firmware_url;
+    http_cfg.timeout_ms = 30000;
+    http_cfg.max_redirection_count = 8;
+    http_cfg.keep_alive_enable = false;
+    http_cfg.buffer_size = 4096;
+    http_cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    http_cfg.user_agent = "Polar-DStar-ESP32/online-ota";
+
+    esp_https_ota_config_t ota_cfg{};
+    ota_cfg.http_config = &http_cfg;
+    ota_cfg.partition.staging = target;
+
+    esp_https_ota_handle_t handle = nullptr;
+    esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
+    if (err != ESP_OK) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Falha ao iniciar OTA: %s", esp_err_to_name(err));
+        update_set_failure(msg);
+        add_log("UPDATE", "%s", msg);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    int read_bytes = 0;
+    for (;;) {
+        err = esp_https_ota_perform(handle);
+        read_bytes = esp_https_ota_get_image_len_read(handle);
+        const int image_size = esp_https_ota_get_image_size(handle);
+        int64_t total = manifest.size > 0 ? manifest.size : image_size;
+        int progress = 1;
+        if (read_bytes > 0 && total > 0) {
+            progress = std::clamp<int>(static_cast<int>((static_cast<int64_t>(read_bytes) * 100) / total), 1, 99);
+        }
+        xSemaphoreTake(g_update_mutex, portMAX_DELAY);
+        g_update.progress = progress;
+        snprintf(g_update.message, sizeof(g_update.message), "Baixando v%s: %d%%", manifest.version, progress);
+        xSemaphoreGive(g_update_mutex);
+
+        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) break;
+        taskYIELD();
+    }
+
+    if (err != ESP_OK || !esp_https_ota_is_complete_data_received(handle)) {
+        esp_https_ota_abort(handle);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Download OTA falhou: %s", esp_err_to_name(err));
+        update_set_failure(msg);
+        add_log("UPDATE", "%s", msg);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (manifest.size > 0 && read_bytes != manifest.size) {
+        esp_https_ota_abort(handle);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Tamanho recebido inválido: %d de %lld bytes",
+                 read_bytes, static_cast<long long>(manifest.size));
+        update_set_failure(msg);
+        add_log("UPDATE", "%s", msg);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    err = esp_https_ota_finish(handle);
+    if (err != ESP_OK) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Validação do firmware falhou: %s", esp_err_to_name(err));
+        update_set_failure(msg);
+        add_log("UPDATE", "%s", msg);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    xSemaphoreTake(g_update_mutex, portMAX_DELAY);
+    g_update.installing = false;
+    g_update.available = false;
+    g_update.progress = 100;
+    snprintf(g_update.message, sizeof(g_update.message), "v%s instalada. Reiniciando...", manifest.version);
+    xSemaphoreGive(g_update_mutex);
+    add_log("UPDATE", "v%s instalada com sucesso; reiniciando", manifest.version);
+    vTaskDelay(pdMS_TO_TICKS(1800));
+    esp_restart();
+}
+
+static esp_err_t api_update_get(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "installed", POLAR_DSTAR_VERSION);
+    cJSON_AddStringToObject(root, "manifest_url", UPDATE_MANIFEST_URL);
+
+    xSemaphoreTake(g_update_mutex, portMAX_DELAY);
+    cJSON_AddBoolToObject(root, "checked", g_update.checked);
+    cJSON_AddBoolToObject(root, "available", g_update.available);
+    cJSON_AddBoolToObject(root, "checking", g_update.checking);
+    cJSON_AddBoolToObject(root, "installing", g_update.installing);
+    cJSON_AddNumberToObject(root, "progress", g_update.progress);
+    cJSON_AddNumberToObject(root, "size", static_cast<double>(g_update.size));
+    cJSON_AddStringToObject(root, "latest", g_update.version);
+    cJSON_AddStringToObject(root, "sha256", g_update.sha256);
+    cJSON_AddStringToObject(root, "message", g_update.message);
+    xSemaphoreGive(g_update_mutex);
+    return send_json(req, root);
+}
+
+static esp_err_t api_update_check(httpd_req_t *req) {
+    if (!wifi_station_connected()) return send_error(req, 400, "Conecte o hotspot à Internet antes de verificar");
+    if (g_host_syncing.load()) return send_error(req, 400, "Aguarde a sincronização dos hosts terminar");
+
+    xSemaphoreTake(g_update_mutex, portMAX_DELAY);
+    if (g_update.checking || g_update.installing) {
+        xSemaphoreGive(g_update_mutex);
+        return send_error(req, 400, "Uma operação de atualização já está em andamento");
+    }
+    g_update.checking = true;
+    g_update.progress = 0;
+    snprintf(g_update.message, sizeof(g_update.message), "Consultando GitHub...");
+    xSemaphoreGive(g_update_mutex);
+
+    if (xTaskCreate(&online_update_check_task, "update_check", 8192, nullptr, 3, nullptr) != pdPASS) {
+        update_set_failure("Não foi possível iniciar a verificação");
+        return send_error(req, 500, "Falha ao criar tarefa de atualização");
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddBoolToObject(root, "queued", true);
+    return send_json(req, root, 202);
+}
+
+static esp_err_t api_update_install(httpd_req_t *req) {
+    if (!wifi_station_connected()) return send_error(req, 400, "Conecte o hotspot à Internet antes de atualizar");
+    if (g_host_syncing.load()) return send_error(req, 400, "Aguarde a sincronização dos hosts terminar");
+
+    xSemaphoreTake(g_update_mutex, portMAX_DELAY);
+    if (g_update.checking || g_update.installing) {
+        xSemaphoreGive(g_update_mutex);
+        return send_error(req, 400, "Uma operação de atualização já está em andamento");
+    }
+    if (!g_update.checked || !g_update.available || !g_update.firmware_url[0]) {
+        xSemaphoreGive(g_update_mutex);
+        return send_error(req, 400, "Nenhuma nova versão verificada");
+    }
+    g_update.installing = true;
+    g_update.progress = 1;
+    snprintf(g_update.message, sizeof(g_update.message), "Preparando atualização para v%s...", g_update.version);
+    xSemaphoreGive(g_update_mutex);
+    g_online_ota_active = true;
+
+    if (xTaskCreate(&online_update_install_task, "online_ota", 12288, nullptr, 4, nullptr) != pdPASS) {
+        update_set_failure("Não foi possível iniciar a OTA online");
+        return send_error(req, 500, "Falha ao criar tarefa OTA");
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddBoolToObject(root, "started", true);
+    return send_json(req, root, 202);
 }
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root, int status = 200) {
@@ -1206,6 +1559,9 @@ static void start_http_server() {
     register_uri(s_httpd, "/api/reboot", HTTP_POST, api_reboot);
     register_uri(s_httpd, "/api/factory-reset", HTTP_POST, api_factory_reset);
     register_uri(s_httpd, "/api/ota", HTTP_POST, api_ota);
+    register_uri(s_httpd, "/api/update", HTTP_GET, api_update_get);
+    register_uri(s_httpd, "/api/update/check", HTTP_POST, api_update_check);
+    register_uri(s_httpd, "/api/update/install", HTTP_POST, api_update_install);
     add_log("WEB", "Dashboard iniciado em HTTP porta 80");
 }
 
@@ -1222,8 +1578,9 @@ extern "C" void app_main(void) {
     g_cfg_mutex = xSemaphoreCreateMutex();
     g_wifi_mutex = xSemaphoreCreateMutex();
     g_hosts_mutex = xSemaphoreCreateMutex();
+    g_update_mutex = xSemaphoreCreateMutex();
     add_log("BOOT", "%s v%s", POLAR_DSTAR_NAME, POLAR_DSTAR_VERSION);
-    add_log("BOOT", "v0.1.7: estabilidade de Redes + hosts completos");
+    add_log("BOOT", "v0.1.8: atualização online pelo GitHub");
     add_log("BOOT", "Reset reason: %d", static_cast<int>(esp_reset_reason()));
     add_log("MMDVM", "Driver serial reservado para v0.2");
     load_config();
