@@ -10,6 +10,8 @@ idf_component_register(
         nvs_flash
         esp_http_server
         esp_http_client
+        esp_https_ota
+        mbedtls
         app_update
         esp_timer
         esp_system
