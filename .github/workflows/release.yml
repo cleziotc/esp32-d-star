@@ -1,0 +1,76 @@
+name: Firmware Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches firmware version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          SOURCE_VERSION="$(grep -E '^#define POLAR_DSTAR_VERSION ' main/version.h | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "Tag: $TAG_VERSION"
+          echo "Source: $SOURCE_VERSION"
+          test "$TAG_VERSION" = "$SOURCE_VERSION"
+
+      - name: Build with ESP-IDF 6.1
+        run: |
+          docker run --rm \
+            -v "$PWD:/project" \
+            -w /project \
+            espressif/idf:v6.1 \
+            bash -lc "python3 tools/generate_web_assets.py && idf.py set-target esp32s3 && idf.py build"
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/polar_dstar_esp32.bin dist/
+          cp build/bootloader/bootloader.bin dist/
+          cp build/partition_table/partition-table.bin dist/
+          if [ -f build/ota_data_initial.bin ]; then
+            cp build/ota_data_initial.bin dist/
+          fi
+
+          sha256sum dist/*.bin > dist/SHA256SUMS.txt
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA256="$(sha256sum dist/polar_dstar_esp32.bin | awk '{print $1}')"
+          SIZE="$(stat -c%s dist/polar_dstar_esp32.bin)"
+
+          cat > dist/latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "target": "esp32s3",
+            "idf": "6.1",
+            "size": ${SIZE},
+            "sha256": "${SHA256}",
+            "firmware": "https://github.com/cleziotc/esp32-d-star/releases/latest/download/polar_dstar_esp32.bin"
+          }
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/polar_dstar_esp32.bin
+            dist/bootloader.bin
+            dist/partition-table.bin
+            dist/ota_data_initial.bin
+            dist/SHA256SUMS.txt
+            dist/latest.json
