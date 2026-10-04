@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#06131e">
+  <title>Polar D-Star</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app-shell">
+  <header class="topbar">
+    <div class="brand" data-page="dashboard">
+      <div class="brand-mark">★</div>
+      <div><strong>Polar D-STAR</strong><small>ESP32 HOTSPOT</small></div>
+    </div>
+    <nav id="mainNav">
+      <button class="nav-btn active" data-page="dashboard">Início</button>
+      <button class="nav-btn" data-page="dstar">D-Star</button>
+      <button class="nav-btn" data-page="network">Redes</button>
+      <button class="nav-btn" data-page="system">Sistema</button>
+      <button class="nav-btn" data-page="logs">Logs</button>
+      <button class="nav-btn" data-page="update">Atualizar</button>
+    </nav>
+    <div class="station-badge"><span class="dot ok"></span><div><b id="topCall">PP5CI</b><small id="topState">ONLINE</small></div></div>
+    <button id="menuBtn" class="menu-btn">☰</button>
+  </header>
+
+  <main>
+    <section class="page active" id="page-dashboard">
+      <div class="grid dashboard-grid">
+        <article class="card call-card">
+          <div class="hero-call"><span id="dashCall">PP5CI</span><small>Módulo <b id="dashModule">B</b></small></div>
+          <div class="online-line"><span class="dot ok"></span><b>ONLINE</b><small id="uptime">Uptime: --</small></div>
+        </article>
+        <article class="card reflector-card">
+          <div class="icon-big">◎</div><div><h2 id="reflectorTitle">XLX300 D</h2><b class="muted-state">DESCONECTADO</b><small>rede D-Star entra na v0.4</small></div>
+        </article>
+        <article class="card">
+          <h3><span class="cyan">⌁</span> RF (D-Star)</h3>
+          <div class="kv"><span>RX</span><b id="rxFreq">438.800000 MHz</b></div>
+          <div class="kv"><span>TX</span><b id="txFreq">438.800000 MHz</b></div>
+          <div class="kv"><span>Modo</span><b>D-Star (DV)</b></div>
+          <div class="kv"><span>MMDVM</span><b class="warn" id="mmdvmState">AGUARDANDO v0.2</b></div>
+        </article>
+        <article class="card">
+          <h3><span class="cyan">◉</span> INTERNET</h3>
+          <div class="kv"><span>Wi-Fi</span><b id="wifiRssi">-- dBm</b></div>
+          <div class="kv"><span>IP</span><b id="wifiIp">0.0.0.0</b></div>
+          <div class="kv"><span>Estado</span><b id="wifiState">AP local</b></div>
+          <div class="kv"><span>Firmware</span><b id="dashFirmwareVersion">--</b></div>
+        </article>
+        <article class="card tx-card span-3">
+          <h3>🎙 Última transmissão</h3>
+          <div class="empty-inline"><b>Nenhuma chamada ainda</b><span>A captura RF será ativada na v0.2 com o driver MMDVM.</span></div>
+        </article>
+        <article class="card status-card">
+          <h3>Estado</h3><div class="state-lamps"><span><i class="lamp off" id="txLamp"></i>TX</span><span><i class="lamp off" id="rxLamp"></i>RX</span></div>
+        </article>
+      </div>
+      <div class="section-head"><h2>Últimas chamadas</h2><button class="ghost" data-page="calls">VER TODAS</button></div>
+      <div class="card table-card"><div class="empty-state">Nenhuma chamada registrada.<small>Esta área já está pronta para receber os eventos da MMDVM na v0.2.</small></div></div>
+    </section>
+
+    <section class="page" id="page-calls">
+      <div class="page-title"><div><h1>▣ Últimas chamadas</h1><p>Atividade RF e rede D-Star.</p></div><button class="ghost" data-page="dashboard">Voltar</button></div>
+      <div class="card table-card">
+        <table><thead><tr><th>Horário</th><th>Indicativo</th><th>Origem</th><th>Destino</th><th>Duração</th><th>RSSI</th><th>BER</th></tr></thead><tbody id="callsBody"></tbody></table>
+        <div class="empty-state" id="callsEmpty">Aguardando integração MMDVM da v0.2.</div>
+      </div>
+    </section>
+
+    <section class="page" id="page-dstar">
+      <div class="page-title"><div><h1>▦ D-Star</h1><p>Configurações de rádio e identidade D-Star (DV).</p></div></div>
+      <form id="dstarForm" class="grid two-col">
+        <article class="card form-card"><h2>Identificação</h2>
+          <label>Indicativo (MYCALL)<input name="callsign" maxlength="15" value="PP5CI"></label>
+          <label>Módulo<select name="module"><option>A</option><option selected>B</option><option>C</option><option>D</option></select></label>
+          <label>Sua localização<input name="location" maxlength="39" value="Joinville - SC"></label>
+          <div class="preview-box"><span>RPT1</span><b id="rpt1Preview">PP5CI B</b><span>RPT2</span><b id="rpt2Preview">PP5CI G</b></div>
+        </article>
+        <article class="card form-card"><h2>Frequências</h2>
+          <label>RX (MHz)<input name="rx_mhz" type="number" step="0.000001" value="438.800000"></label>
+          <label>TX (MHz)<input name="tx_mhz" type="number" step="0.000001" value="438.800000"></label>
+          <div class="form-row"><label>RX Offset (kHz)<input name="rx_offset_khz" type="number" step="0.1" value="0"></label><label>TX Offset (kHz)<input name="tx_offset_khz" type="number" step="0.1" value="0"></label></div>
+          <label>TX Level <input name="tx_level" type="range" min="0" max="100" value="50"><output id="txLevelOut">50</output></label>
+          <label>RX Level <input name="rx_level" type="range" min="0" max="100" value="50"><output id="rxLevelOut">50</output></label>
+          <button class="primary" type="submit">Salvar</button>
+        </article>
+      </form>
+      <div class="notice"><b>v0.1</b> Estas configurações já são persistidas em NVS. A aplicação delas à MMDVM entra na v0.2.</div>
+    </section>
+
+    <section class="page" id="page-network">
+      <div class="page-title"><div><h1>♧ Rede D-Star</h1><p>Wi-Fi, reflectores e arquivos de hosts.</p></div></div>
+      <div class="grid two-col">
+        <article class="card form-card"><h2>Wi-Fi</h2>
+          <div class="status-strip"><span class="dot" id="wifiDot"></span><b id="wifiSummary">Carregando...</b></div>
+          <div class="wifi-toolbar"><button class="ghost" type="button" id="scanWifiBtn">Pesquisar redes</button><span id="wifiProfileCount">0/5 redes salvas</span></div>
+          <div id="wifiScanResults" class="wifi-list compact"><div class="empty-mini">Clique em “Pesquisar redes”.</div></div>
+          <form id="wifiForm" class="wifi-add-form">
+            <label>SSID<input name="ssid" maxlength="32" autocomplete="off" placeholder="Selecione acima ou digite o SSID"></label>
+            <label>Senha<input name="password" maxlength="64" type="password" autocomplete="new-password" placeholder="Senha da rede"></label>
+            <button class="primary" type="submit">Salvar e conectar</button>
+          </form>
+          <h3 class="subhead">Redes salvas</h3>
+          <div id="savedNetworks" class="wifi-list"><div class="empty-mini">Nenhuma rede salva.</div></div>
+          <small class="hint">Até 5 SSIDs são armazenados. O hotspot tenta automaticamente as redes salvas e mantém o AP <b>Polar-DSTAR-XXXX</b> ativo em 192.168.4.1.</small>
+        </article>
+        <article class="card form-card"><h2>Reflector</h2>
+          <div class="tabs" id="reflectorTabs"><button type="button" class="tab active" data-ref-type="XLX">XLX</button><button type="button" class="tab" data-ref-type="REF">REF</button><button type="button" class="tab" data-ref-type="XRF">XRF</button><button type="button" class="tab" data-ref-type="DCS">DCS</button></div>
+          <div class="form-row"><label>Reflector<select id="reflectorSelect"><option>Carregando...</option></select></label><label>Módulo<select id="reflectorModule"></select></label></div>
+          <div class="reflector-actions"><button class="primary" type="button" id="saveReflectorBtn">Salvar seleção</button><button class="ghost" type="button" disabled>Conectar</button></div>
+          <p class="future">A seleção já fica salva; o motor de conexão D-Star entra na v0.4.</p>
+          <div class="host-sync-box">
+            <div><b>Arquivos de hosts</b><span id="hostSyncState">Carregando...</span><small id="hostCounts">—</small></div>
+            <button class="ghost" type="button" id="syncHostsBtn">Atualizar agora</button>
+          </div>
+          <small class="hint">Fonte: Pi-Star <b>DStar_Hosts.json</b>. Sincronização automática diária às <b>03:00 (UTC-3)</b>.</small>
+        </article>
+      </div>
+    </section>
+
+    <section class="page" id="page-radio">
+      <div class="page-title"><div><h1>⌁ Status do Rádio</h1><p>Estrutura em tempo real pronta para a MMDVM.</p></div><span class="pill wait">MMDVM v0.2</span></div>
+      <div class="grid radio-top"><article class="card metric"><div class="icon-big">⌁</div><div><h2 id="radioFreq">438.800000 MHz</h2><small>D-Star (DV)</small></div></article><article class="card meter"><h3>RSSI</h3><div class="big-value">-- <small>dBm</small></div><div class="bar"><i style="width:0%"></i></div></article><article class="card meter"><h3>BER</h3><div class="big-value">-- <small>%</small></div><div class="bar"><i style="width:0%"></i></div></article></div>
+      <article class="card chart-card"><h3>Espectro / Nível de sinal <small>(placeholder v0.1)</small></h3><canvas id="signalChart" width="1100" height="260"></canvas></article>
+      <div class="grid four-col"><article class="card mini"><b>MMDVM</b><span>Driver: v0.2</span></article><article class="card mini"><b>Temperatura</b><span>ESP32-S3</span></article><article class="card mini"><b>CPU</b><span id="heapMini">--</span></article><article class="card mini"><b>Wi-Fi</b><span id="rssiMini">--</span></article></div>
+    </section>
+
+    <section class="page" id="page-system">
+      <div class="page-title"><div><h1>⚙ Sistema</h1><p>Informações do dispositivo e configurações gerais.</p></div></div>
+      <div class="grid two-col">
+        <article class="card"><h2>Informações</h2><div id="systemInfo" class="system-info"></div></article>
+        <article class="card action-list"><h2>Opções</h2><button data-page="network">◉ Configurações de Wi-Fi <b>›</b></button><button data-page="dstar">☷ Configurações D-Star <b>›</b></button><button data-page="radio">⌁ Status do rádio <b>›</b></button><button data-page="update">↻ Atualização OTA <b>›</b></button><button id="rebootBtn">◷ Reiniciar dispositivo <b>›</b></button><button class="danger" id="factoryBtn">♜ Apagar configurações <b>›</b></button></article>
+      </div>
+    </section>
+
+    <section class="page" id="page-logs">
+      <div class="page-title"><div><h1>✹ Logs</h1><p>Eventos do sistema, rede e rádio em tempo real.</p></div><button class="ghost" id="refreshLogs">Atualizar</button></div>
+      <article class="card log-card"><pre id="logBox">Carregando...</pre></article>
+    </section>
+
+    <section class="page" id="page-update">
+      <div class="page-title"><div><h1>◆ Atualização de Firmware</h1><p>Atualize o hotspot pelo ar (OTA).</p></div></div>
+      <div class="grid two-col">
+        <article class="card"><h2>Versão atual</h2><div class="firmware-version">Polar D-Star <b id="otaFirmwareVersion">--</b></div><div id="buildInfo" class="hint">--</div></article>
+        <article class="card form-card"><h2>Nova versão</h2><div class="dropzone" id="dropzone"><span>☁</span><b>Selecione um firmware .bin</b><input type="file" id="otaFile" accept=".bin,application/octet-stream"></div><button class="primary" id="otaBtn" type="button">Iniciar atualização</button><div class="progress"><i id="otaProgress"></i></div><p id="otaMsg" class="hint"></p></article>
+      </div>
+    </section>
+  </main>
+
+  <footer><span id="footerVersion">Polar D-Star ESP32</span><button data-page="radio">Status do Rádio</button></footer>
+  <div id="toast" class="toast"></div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
