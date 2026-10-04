@@ -438,3 +438,223 @@ static HostKind host_kind_from_name(const char *name) {
     if (strncmp(name, "REF", 3) == 0) return HostKind::REF;
     if (strncmp(name, "XRF", 3) == 0) return HostKind::XRF;
     return HostKind::DCS;
+}
+
+static const char *host_kind_name(HostKind kind) {
+    switch (kind) {
+        case HostKind::XLX: return "XLX";
+        case HostKind::REF: return "REF";
+        case HostKind::XRF: return "XRF";
+        default: return "DCS";
+    }
+}
+
+static bool accepted_host_name(const char *name) {
+    return name && (strncmp(name, "XLX", 3) == 0 || strncmp(name, "REF", 3) == 0 ||
+                    strncmp(name, "XRF", 3) == 0 || strncmp(name, "DCS", 3) == 0);
+}
+
+static bool parse_ipv4(const char *text, uint8_t out[4]) {
+    if (!text) return false;
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char tail = '\0';
+    if (sscanf(text, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return false;
+    if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+    out[0] = static_cast<uint8_t>(a);
+    out[1] = static_cast<uint8_t>(b);
+    out[2] = static_cast<uint8_t>(c);
+    out[3] = static_cast<uint8_t>(d);
+    return true;
+}
+
+static void format_ipv4(const uint8_t ip[4], char *out, size_t out_len) {
+    snprintf(out, out_len, "%u.%u.%u.%u",
+             static_cast<unsigned>(ip[0]), static_cast<unsigned>(ip[1]),
+             static_cast<unsigned>(ip[2]), static_cast<unsigned>(ip[3]));
+}
+
+static bool parse_host_object(const char *obj, HostEntry &out) {
+    cJSON *json = cJSON_Parse(obj);
+    if (!json) return false;
+    cJSON *name = cJSON_GetObjectItemCaseSensitive(json, "name");
+    cJSON *ip = cJSON_GetObjectItemCaseSensitive(json, "ipv4");
+    bool ok = cJSON_IsString(name) && cJSON_IsString(ip) && name->valuestring && ip->valuestring &&
+              accepted_host_name(name->valuestring) && parse_ipv4(ip->valuestring, out.ip);
+    if (ok) {
+        copy_cstr(out.name, name->valuestring);
+        out.kind = host_kind_from_name(out.name);
+    }
+    cJSON_Delete(json);
+    return ok;
+}
+
+static void save_host_sync_time(int64_t epoch) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i64(h, "host_sync", epoch);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static bool download_host_list() {
+    if (!wifi_station_connected()) return false;
+    g_host_syncing = true;
+    add_log("HOSTS", "Sincronizando DStar_Hosts.json do Pi-Star");
+
+    esp_http_client_config_t cfg{};
+    cfg.url = HOSTS_URL;
+    cfg.timeout_ms = 30000;
+    cfg.keep_alive_enable = false;
+    cfg.buffer_size = 2048;
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) { g_host_syncing = false; return false; }
+    esp_http_client_set_header(client, "User-Agent", "Polar-DStar-ESP32/0.1.7");
+    esp_http_client_set_header(client, "Connection", "close");
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        add_log("HOSTS", "Falha HTTP: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        g_host_syncing = false;
+        return false;
+    }
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        add_log("HOSTS", "Servidor respondeu HTTP %d", status);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        g_host_syncing = false;
+        return false;
+    }
+
+    HostEntry *temp = static_cast<HostEntry *>(calloc(HOST_CAP, sizeof(HostEntry)));
+    if (!temp) {
+        add_log("HOSTS", "Sem memória para lista temporária");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        g_host_syncing = false;
+        return false;
+    }
+
+    size_t count = 0;
+    int depth = 0;
+    bool in_string = false, escape = false, capturing = false, object_overflow = false, list_truncated = false;
+    char object[384]{};
+    size_t object_len = 0;
+    char buf[2048];
+    int r = 0;
+    int transient_reads = 0;
+    for (;;) {
+        r = esp_http_client_read(client, buf, sizeof(buf));
+        if (r == -ESP_ERR_HTTP_EAGAIN && transient_reads < 20) {
+            ++transient_reads;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        if (r <= 0) break;
+        transient_reads = 0;
+        for (int i = 0; i < r; ++i) {
+            const char c = buf[i];
+            if (in_string) {
+                if (capturing) {
+                    if (object_len + 1 < sizeof(object)) object[object_len++] = c;
+                    else object_overflow = true;
+                }
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') in_string = false;
+                continue;
+            }
+            if (c == '"') {
+                if (capturing) {
+                    if (object_len + 1 < sizeof(object)) object[object_len++] = c;
+                    else object_overflow = true;
+                }
+                in_string = true;
+                continue;
+            }
+            if (c == '{') {
+                if (depth == 1) { capturing = true; object_len = 0; object_overflow = false; }
+                ++depth;
+                if (capturing) {
+                    if (object_len + 1 < sizeof(object)) object[object_len++] = c;
+                    else object_overflow = true;
+                }
+                continue;
+            }
+            if (c == '}') {
+                if (capturing) {
+                    if (object_len + 1 < sizeof(object)) object[object_len++] = c;
+                    else object_overflow = true;
+                }
+                if (depth == 2 && capturing) {
+                    object[std::min(object_len, sizeof(object) - 1)] = '\0';
+                    HostEntry entry{};
+                    if (!object_overflow && parse_host_object(object, entry)) {
+                        if (count < HOST_CAP) temp[count++] = entry;
+                        else list_truncated = true;
+                    }
+                    capturing = false;
+                    object_len = 0;
+                    object_overflow = false;
+                }
+                if (depth > 0) --depth;
+                continue;
+            }
+            if (capturing) {
+                if (object_len + 1 < sizeof(object)) object[object_len++] = c;
+                else object_overflow = true;
+            }
+        }
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    size_t parsed_counts[4]{};
+    for (size_t i = 0; i < count; ++i) ++parsed_counts[static_cast<int>(temp[i].kind)];
+    const bool complete_enough = count >= 2000 && parsed_counts[0] > 0 && parsed_counts[1] > 0 && parsed_counts[2] > 0 && parsed_counts[3] > 0;
+    if (r < 0 || !complete_enough) {
+        add_log("HOSTS", "Sincronização inválida: %u entradas (XLX %u REF %u XRF %u DCS %u)",
+                static_cast<unsigned>(count),
+                static_cast<unsigned>(parsed_counts[0]), static_cast<unsigned>(parsed_counts[1]),
+                static_cast<unsigned>(parsed_counts[2]), static_cast<unsigned>(parsed_counts[3]));
+        free(temp);
+        g_host_syncing = false;
+        return false;
+    }
+
+    std::sort(temp, temp + count, [](const HostEntry &a, const HostEntry &b) {
+        if (a.kind != b.kind) return static_cast<int>(a.kind) < static_cast<int>(b.kind);
+        return strcmp(a.name, b.name) < 0;
+    });
+    size_t compact = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (compact && temp[i].kind == temp[compact - 1].kind && strcmp(temp[i].name, temp[compact - 1].name) == 0) continue;
+        temp[compact++] = temp[i];
+    }
+
+    xSemaphoreTake(g_hosts_mutex, portMAX_DELAY);
+    memcpy(g_hosts, temp, compact * sizeof(HostEntry));
+    g_host_count = compact;
+    xSemaphoreGive(g_hosts_mutex);
+    free(temp);
+
+    time_t now = time(nullptr);
+    if (now > 1700000000) {
+        g_host_last_sync = static_cast<int64_t>(now);
+        save_host_sync_time(g_host_last_sync);
+    }
+    if (list_truncated) add_log("HOSTS", "Aviso: lista atingiu o limite interno de %u entradas", static_cast<unsigned>(HOST_CAP));
+    add_log("HOSTS", "Lista sincronizada: %u reflectores (XLX %u REF %u XRF %u DCS %u)",
+            static_cast<unsigned>(compact),
+            static_cast<unsigned>(parsed_counts[0]), static_cast<unsigned>(parsed_counts[1]),
+            static_cast<unsigned>(parsed_counts[2]), static_cast<unsigned>(parsed_counts[3]));
+    g_host_syncing = false;
+    return true;
+}
+
+static bool daily_host_sync_due() {
+    time_t now = time(nullptr);
+    if (now <= 1700000000) return false;
+    struct tm today{}, last{};
