@@ -4,15 +4,16 @@ Firmware dedicado em **ESP-IDF 6.1** para ESP32-S3, com interface web, Wi-Fi, OT
 
 ## Versão estável atual
 
-**v0.1.8** — build automatizado e OTA online via GitHub.
+**v0.1.9** — OTA online robusta via GitHub, manifesto direto e detalhes completos das releases.
 
 Principais recursos atuais:
 
 - dashboard web responsivo;
 - AP de manutenção permanente em `192.168.4.1`;
 - até 5 redes Wi-Fi salvas;
-- atualização OTA online diretamente das Releases do GitHub;
+- atualização OTA online diretamente das Releases do GitHub, com manifesto leve e verificação automática;
 - atualização OTA manual por arquivo `.bin` como recuperação;
+- detalhes da release instalada e da release disponível exibidos na própria interface;
 - sincronização de XLX / REF / XRF / DCS pelo `DStar_Hosts.json`;
 - atualização automática dos hosts às 03:00 (UTC-3);
 - persistência das configurações em NVS;
