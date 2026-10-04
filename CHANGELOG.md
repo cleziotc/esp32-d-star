@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.8
+- Adiciona verificação de atualização online diretamente no GitHub.
+- Adiciona instalação OTA online sem baixar o arquivo `.bin` no computador.
+- Usa HTTPS com o bundle de certificados do ESP-IDF.
+- Download e gravação ocorrem em tarefa separada para não bloquear o servidor web.
+- Exibe progresso da atualização no dashboard.
+- Valida tamanho recebido e a imagem de aplicação antes de trocar a partição de boot.
+- Mantém a atualização manual por `.bin` como alternativa de recuperação.
+- GitHub Actions continua gerando automaticamente firmware, checksums e `latest.json`.
+
 ## v0.1.7
 - Corrige reinicialização/instabilidade ao abrir a página **Redes** com listas grandes de reflectores.
 - `/api/reflectors` passa a enviar JSON em streaming, sem montar milhares de objetos cJSON na RAM.
