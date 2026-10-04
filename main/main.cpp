@@ -878,3 +878,223 @@ static esp_err_t api_wifi_scan(httpd_req_t *req) {
         cJSON_AddNumberToObject(it, "channel", records[i].primary);
         cJSON_AddBoolToObject(it, "open", records[i].authmode == WIFI_AUTH_OPEN);
         cJSON_AddItemToArray(items, it);
+    }
+    free(records);
+    return send_json(req, root);
+}
+
+static void restart_task(void *arg) {
+    int delay_ms = reinterpret_cast<intptr_t>(arg);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    esp_restart();
+}
+
+static esp_err_t api_wifi_post(httpd_req_t *req) {
+    std::string body = recv_body(req);
+    if (body.empty()) return send_error(req, 400, "JSON ausente");
+    cJSON *json = cJSON_Parse(body.c_str());
+    if (!json) return send_error(req, 400, "JSON inválido");
+    cJSON *ssid = cJSON_GetObjectItemCaseSensitive(json, "ssid");
+    cJSON *pass = cJSON_GetObjectItemCaseSensitive(json, "password");
+    if (!cJSON_IsString(ssid) || !ssid->valuestring || !ssid->valuestring[0] || strlen(ssid->valuestring) > 32) {
+        cJSON_Delete(json);
+        return send_error(req, 400, "SSID inválido");
+    }
+    const char *p = cJSON_IsString(pass) && pass->valuestring ? pass->valuestring : "";
+    if (strlen(p) > 64) {
+        cJSON_Delete(json);
+        return send_error(req, 400, "Senha inválida");
+    }
+    std::string saved = ssid->valuestring;
+    int index = upsert_wifi_profile(ssid->valuestring, p);
+    cJSON_Delete(json);
+    if (index == -2) return send_error(req, 400, "Limite de 5 redes Wi-Fi atingido");
+    if (index < 0) return send_error(req, 500, "Falha ao salvar rede Wi-Fi");
+    g_wifi_requested_index = index;
+    add_log("WIFI", "Rede %s salva no perfil %d", saved.c_str(), index + 1);
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddBoolToObject(out, "ok", true);
+    cJSON_AddNumberToObject(out, "profile", index);
+    cJSON_AddBoolToObject(out, "connecting", true);
+    return send_json(req, out, 202);
+}
+
+static esp_err_t api_wifi_delete(httpd_req_t *req) {
+    std::string body = recv_body(req);
+    cJSON *json = body.empty() ? nullptr : cJSON_Parse(body.c_str());
+    cJSON *ssid = json ? cJSON_GetObjectItemCaseSensitive(json, "ssid") : nullptr;
+    if (!cJSON_IsString(ssid) || !ssid->valuestring) {
+        if (json) cJSON_Delete(json);
+        return send_error(req, 400, "SSID inválido");
+    }
+    std::string victim = ssid->valuestring;
+    bool was_current = current_wifi_ssid() == victim;
+    bool ok = delete_wifi_profile(victim.c_str());
+    cJSON_Delete(json);
+    if (!ok) return send_error(req, 400, "Rede não encontrada");
+    add_log("WIFI", "Rede salva removida: %s", victim.c_str());
+    if (was_current) esp_wifi_disconnect();
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddBoolToObject(out, "ok", true);
+    return send_json(req, out);
+}
+
+static void host_counts(size_t counts[4]) {
+    memset(counts, 0, 4 * sizeof(size_t));
+    xSemaphoreTake(g_hosts_mutex, portMAX_DELAY);
+    for (size_t i = 0; i < g_host_count; ++i) ++counts[static_cast<int>(g_hosts[i].kind)];
+    xSemaphoreGive(g_hosts_mutex);
+}
+
+static esp_err_t api_hosts_status(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    size_t counts[4]{};
+    host_counts(counts);
+    cJSON_AddStringToObject(root, "source", "Pi-Star DStar_Hosts.json");
+    cJSON_AddStringToObject(root, "source_url", HOSTS_URL);
+    cJSON_AddStringToObject(root, "schedule", "Diariamente às 03:00 (UTC-3)");
+    cJSON_AddBoolToObject(root, "syncing", g_host_syncing.load());
+    cJSON_AddNumberToObject(root, "last_sync_epoch", static_cast<double>(g_host_last_sync));
+    cJSON_AddBoolToObject(root, "time_synced", time(nullptr) > 1700000000);
+    char when[40] = "Nunca";
+    if (g_host_last_sync > 1700000000) {
+        time_t t = static_cast<time_t>(g_host_last_sync);
+        struct tm local{};
+        localtime_r(&t, &local);
+        strftime(when, sizeof(when), "%d/%m/%Y %H:%M:%S", &local);
+    }
+    cJSON_AddStringToObject(root, "last_sync", when);
+    cJSON *obj = cJSON_AddObjectToObject(root, "counts");
+    cJSON_AddNumberToObject(obj, "XLX", counts[static_cast<int>(HostKind::XLX)]);
+    cJSON_AddNumberToObject(obj, "REF", counts[static_cast<int>(HostKind::REF)]);
+    cJSON_AddNumberToObject(obj, "XRF", counts[static_cast<int>(HostKind::XRF)]);
+    cJSON_AddNumberToObject(obj, "DCS", counts[static_cast<int>(HostKind::DCS)]);
+    return send_json(req, root);
+}
+
+static esp_err_t api_hosts_sync(httpd_req_t *req) {
+    if (!wifi_station_connected()) return send_error(req, 400, "Conecte o hotspot à Internet antes de sincronizar");
+    if (g_host_syncing.load()) return send_error(req, 400, "Sincronização já está em andamento");
+    g_host_sync_requested = true;
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddBoolToObject(root, "queued", true);
+    return send_json(req, root, 202);
+}
+
+static HostKind query_host_kind(httpd_req_t *req) {
+    char query[48]{};
+    char type[8] = "XLX";
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "type", type, sizeof(type));
+    }
+    if (strcmp(type, "REF") == 0) return HostKind::REF;
+    if (strcmp(type, "XRF") == 0) return HostKind::XRF;
+    if (strcmp(type, "DCS") == 0) return HostKind::DCS;
+    return HostKind::XLX;
+}
+
+static esp_err_t api_reflectors(httpd_req_t *req) {
+    const HostKind wanted = query_host_kind(req);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    char head[48];
+    snprintf(head, sizeof(head), "{\"type\":\"%s\",\"items\":[", host_kind_name(wanted));
+    esp_err_t err = httpd_resp_send_chunk(req, head, HTTPD_RESP_USE_STRLEN);
+    if (err != ESP_OK) return err;
+
+    bool first = true;
+    char chunk[96];
+    xSemaphoreTake(g_hosts_mutex, portMAX_DELAY);
+    for (size_t i = 0; i < g_host_count; ++i) {
+        if (g_hosts[i].kind != wanted) continue;
+        char ip[16];
+        format_ipv4(g_hosts[i].ip, ip, sizeof(ip));
+        int n = snprintf(chunk, sizeof(chunk), "%s{\"name\":\"%s\",\"ip\":\"%s\"}",
+                         first ? "" : ",", g_hosts[i].name, ip);
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(chunk)) continue;
+        err = httpd_resp_send_chunk(req, chunk, static_cast<ssize_t>(n));
+        if (err != ESP_OK) break;
+        first = false;
+    }
+    xSemaphoreGive(g_hosts_mutex);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, "]}", 2);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, nullptr, 0);
+    return err;
+}
+
+static esp_err_t api_system(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    esp_chip_info_t chip{};
+    esp_chip_info(&chip);
+    uint32_t flash = 0;
+    esp_flash_get_size(nullptr, &flash);
+    uint8_t mac[6]{};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char macs[20];
+    format_mac(macs, sizeof(macs), mac);
+    const esp_app_desc_t *desc = esp_app_get_description();
+
+    cJSON_AddStringToObject(root, "model", "ESP32-S3 WROOM");
+    cJSON_AddStringToObject(root, "firmware", POLAR_DSTAR_NAME);
+    cJSON_AddStringToObject(root, "version", POLAR_DSTAR_VERSION);
+    cJSON_AddStringToObject(root, "idf", esp_get_idf_version());
+    cJSON_AddStringToObject(root, "build_date", desc->date);
+    cJSON_AddStringToObject(root, "build_time", desc->time);
+    cJSON_AddNumberToObject(root, "uptime_s", uptime_ms() / 1000ULL);
+    cJSON_AddNumberToObject(root, "cores", chip.cores);
+    cJSON_AddNumberToObject(root, "flash_bytes", flash);
+    cJSON_AddNumberToObject(root, "heap_free", esp_get_free_heap_size());
+    cJSON_AddNumberToObject(root, "heap_min", esp_get_minimum_free_heap_size());
+    const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    cJSON_AddNumberToObject(root, "psram_total", psram_total);
+    cJSON_AddNumberToObject(root, "psram_free", psram_free);
+#ifdef CONFIG_SPIRAM
+    cJSON_AddStringToObject(root, "psram_state", psram_total ? "ativa" : "não detectada");
+#else
+    cJSON_AddStringToObject(root, "psram_state", "não habilitada");
+#endif
+    cJSON_AddStringToObject(root, "ip", preferred_access_ip().c_str());
+    cJSON_AddStringToObject(root, "sta_ip", station_ip().c_str());
+    cJSON_AddStringToObject(root, "ap_ip", access_point_ip().c_str());
+    cJSON_AddNumberToObject(root, "rssi", station_rssi());
+    cJSON_AddStringToObject(root, "mac", macs);
+    return send_json(req, root);
+}
+
+static esp_err_t api_logs(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "items");
+    xSemaphoreTake(g_log_mutex, portMAX_DELAY);
+    size_t start = (g_log_head + LOG_CAP - g_log_count) % LOG_CAP;
+    for (size_t i = 0; i < g_log_count; ++i) {
+        const LogLine &line = g_logs[(start + i) % LOG_CAP];
+        cJSON *it = cJSON_CreateObject();
+        cJSON_AddNumberToObject(it, "ms", static_cast<double>(line.ms));
+        cJSON_AddStringToObject(it, "level", line.level);
+        cJSON_AddStringToObject(it, "text", line.text);
+        cJSON_AddItemToArray(arr, it);
+    }
+    xSemaphoreGive(g_log_mutex);
+    return send_json(req, root);
+}
+
+static esp_err_t api_calls(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddArrayToObject(root, "items");
+    cJSON_AddStringToObject(root, "note", "Histórico de chamadas será ativado com a MMDVM na v0.2");
+    return send_json(req, root);
+}
+
+static esp_err_t api_reboot(httpd_req_t *req) {
+    add_log("SYS", "Reinicialização solicitada pela interface");
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddBoolToObject(root, "restarting", true);
+    esp_err_t resp = send_json(req, root, 202);
+    xTaskCreate(&restart_task, "restart", 2048, reinterpret_cast<void *>(1200), 5, nullptr);
+    return resp;
+}
+
