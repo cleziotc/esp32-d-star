@@ -1,6 +1,6 @@
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let statusCache={}, configCache={};
-let currentReflectorType="XLX", hostPollTimer=null, updatePollTimer=null;
+let currentReflectorType="XLX", hostPollTimer=null, updatePollTimer=null, updateAutoCheckStarted=false;
 function applyVersion(v){const label='v'+v;const d=$('#dashFirmwareVersion');if(d)d.textContent=label;const o=$('#otaFirmwareVersion');if(o)o.textContent=label;const f=$('#footerVersion');if(f)f.textContent='Polar D-Star ESP32 '+label;}
 function setLamp(id,on,kind){const el=$(id);if(!el)return;el.className='lamp '+(on?(kind||'rx'):'off');}
 function toast(msg,error=false){const t=$('#toast');t.textContent=msg;t.className='toast show'+(error?' error':'');clearTimeout(window.__toast);window.__toast=setTimeout(()=>t.className='toast',2800)}
@@ -32,11 +32,30 @@ async function loadLogs(){try{const d=await api('/api/logs');$('#logBox').textCo
 $('#refreshLogs').onclick=loadLogs;
 $('#rebootBtn').onclick=async()=>{if(!confirm('Reiniciar o Polar D-Star agora?'))return;try{await api('/api/reboot',{method:'POST'});toast('Reiniciando...')}catch(e){toast(e.message,true)}};
 $('#factoryBtn').onclick=async()=>{if(!confirm('Apagar Wi-Fi e todas as configurações? Esta ação reinicia o equipamento.'))return;try{await api('/api/factory-reset',{method:'POST'});toast('Configurações apagadas. Reiniciando...')}catch(e){toast(e.message,true)}};
+function fmtBytes(n){n=Number(n||0);if(!n)return '—';if(n>=1048576)return (n/1048576).toFixed(2)+' MB';if(n>=1024)return Math.round(n/1024)+' KB';return n+' B'}
+function fmtReleaseDate(v){if(!v)return '—';const d=new Date(v);return Number.isNaN(d.getTime())?v:d.toLocaleString('pt-BR')}
+function setUpdateText(id,value,fallback='—'){const el=$(id);if(el)el.textContent=(value===undefined||value===null||value==='')?fallback:value}
 function renderOnlineUpdate(u){
+  applyVersion(u.installed||statusCache.version||'0.0.0');
+  setUpdateText('#installedVersion',u.installed?'v'+u.installed:'—');
+  setUpdateText('#buildInfo',(u.installed_build_date&&u.installed_build_time)?(u.installed_build_date+' '+u.installed_build_time):'—');
+  setUpdateText('#installedIdf',u.installed_idf);
+  setUpdateText('#installedTarget',u.installed_target);
+  setUpdateText('#installedPartition',u.installed_partition?(u.installed_partition+' • '+fmtBytes(u.installed_partition_size)):'—');
+  setUpdateText('#installedSha',u.installed_elf_sha256);
+  setUpdateText('#installedNotes',u.installed_notes,'Sem notas incorporadas nesta versão.');
+
   const latest=$('#onlineUpdateVersion'),state=$('#onlineUpdateState'),msg=$('#onlineUpdateMsg');
-  const check=$('#checkUpdateBtn'),install=$('#onlineUpdateBtn'),bar=$('#onlineUpdateProgress');
+  const check=$('#checkUpdateBtn'),install=$('#onlineUpdateBtn'),bar=$('#onlineUpdateProgress'),badge=$('#onlineReleaseBadge');
   if(!latest||!state||!check||!install||!bar)return;
   latest.textContent=u.latest?('v'+u.latest):'—';
+  setUpdateText('#onlinePublishedAt',fmtReleaseDate(u.latest_published_at));
+  setUpdateText('#onlineIdf',u.latest_idf);
+  setUpdateText('#onlineTarget',u.latest_target);
+  setUpdateText('#onlineSize',fmtBytes(u.size));
+  setUpdateText('#onlineSha',u.sha256);
+  setUpdateText('#onlineNotes',u.latest_notes,u.checked?'Sem notas publicadas para esta release.':'Aguardando consulta ao GitHub...');
+
   state.textContent=u.message||'Ainda não verificado.';
   const progress=Math.max(0,Math.min(100,Number(u.progress||0)));
   bar.style.width=progress+'%';
@@ -44,22 +63,43 @@ function renderOnlineUpdate(u){
   install.disabled=!u.available||u.checking||u.installing;
   check.textContent=u.checking?'Verificando...':'Verificar agora';
   install.textContent=u.installing?('Atualizando '+progress+'%'):'Atualizar agora';
+
+  if(badge){
+    if(u.checking){badge.textContent='CONSULTANDO';badge.className='pill release-badge wait'}
+    else if(u.available){badge.textContent='NOVA RELEASE';badge.className='pill release-badge new'}
+    else if(u.checked){badge.textContent='ATUALIZADO';badge.className='pill release-badge ok'}
+    else{badge.textContent='NÃO VERIFICADO';badge.className='pill release-badge wait'}
+  }
+
   if(u.installing)msg.textContent='Baixando e gravando o firmware. Não desligue o equipamento.';
-  else if(u.available)msg.textContent='Nova versão v'+u.latest+' disponível para instalação direta.';
-  else if(u.checked)msg.textContent='Nenhuma atualização pendente.';
+  else if(u.available)msg.textContent='Nova versão v'+u.latest+' disponível. Confira os dados acima antes de instalar.';
+  else if(u.checked)msg.textContent='A release instalada é a mais recente publicada no GitHub.';
   else msg.textContent='';
+
   clearTimeout(updatePollTimer);
-  if(u.checking||u.installing)updatePollTimer=setTimeout(loadOnlineUpdate,1000);
+  if(u.checking||u.installing)updatePollTimer=setTimeout(()=>loadOnlineUpdate(false),1000);
 }
-async function loadOnlineUpdate(){
-  try{const u=await api('/api/update');renderOnlineUpdate(u)}
-  catch(e){const state=$('#onlineUpdateState');if(state)state.textContent='Não foi possível consultar o estado da atualização.'}
+async function loadOnlineUpdate(triggerAuto=true){
+  try{
+    const u=await api('/api/update');
+    renderOnlineUpdate(u);
+    if(triggerAuto&&!updateAutoCheckStarted&&!u.checked&&!u.checking&&!u.installing&&(u.message==='Ainda não verificado'||!u.message)){
+      updateAutoCheckStarted=true;
+      try{
+        await api('/api/update/check',{method:'POST'});
+        clearTimeout(updatePollTimer);updatePollTimer=setTimeout(()=>loadOnlineUpdate(false),500)
+      }catch(e){
+        const state=$('#onlineUpdateState');if(state)state.textContent=e.message;
+      }
+    }
+  }catch(e){const state=$('#onlineUpdateState');if(state)state.textContent='Não foi possível consultar o estado da atualização.'}
 }
 $('#checkUpdateBtn').onclick=async()=>{
+  updateAutoCheckStarted=true;
   try{
     await api('/api/update/check',{method:'POST'});
-    toast('Consultando a última versão no GitHub...');
-    clearTimeout(updatePollTimer);updatePollTimer=setTimeout(loadOnlineUpdate,500)
+    toast('Consultando a última release no GitHub...');
+    clearTimeout(updatePollTimer);updatePollTimer=setTimeout(()=>loadOnlineUpdate(false),500)
   }catch(e){toast(e.message,true)}
 };
 $('#onlineUpdateBtn').onclick=async()=>{
@@ -68,7 +108,7 @@ $('#onlineUpdateBtn').onclick=async()=>{
   try{
     await api('/api/update/install',{method:'POST'});
     toast('Atualização online iniciada');
-    clearTimeout(updatePollTimer);updatePollTimer=setTimeout(loadOnlineUpdate,500)
+    clearTimeout(updatePollTimer);updatePollTimer=setTimeout(()=>loadOnlineUpdate(false),500)
   }catch(e){toast(e.message,true)}
 };
 $('#otaBtn').onclick=async()=>{const file=$('#otaFile').files[0];if(!file){toast('Selecione o arquivo .bin',true);return}if(!confirm(`Atualizar com ${file.name} (${Math.round(file.size/1024)} KB)?`))return;const btn=$('#otaBtn');btn.disabled=true;$('#otaMsg').textContent='Enviando firmware...';$('#otaProgress').style.width='15%';try{const r=await fetch('/api/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});$('#otaProgress').style.width='90%';const j=await r.json();if(!r.ok)throw new Error(j.error||'Falha na atualização');$('#otaProgress').style.width='100%';$('#otaMsg').textContent='Firmware gravado. Reiniciando...';toast('OTA concluída')}catch(e){$('#otaMsg').textContent=e.message;toast(e.message,true);btn.disabled=false;$('#otaProgress').style.width='0'}};

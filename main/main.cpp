@@ -74,7 +74,7 @@ static std::atomic<bool> g_host_syncing{false};
 static int64_t g_host_last_sync = 0;
 
 static constexpr const char *UPDATE_MANIFEST_URL =
-    "https://github.com/cleziotc/esp32-d-star/releases/latest/download/latest.json";
+    "https://raw.githubusercontent.com/cleziotc/esp32-d-star/main/update/latest.json";
 
 struct OnlineUpdateState {
     bool checked{false};
@@ -84,15 +84,27 @@ struct OnlineUpdateState {
     int progress{0};
     int64_t size{0};
     char version[16]{};
+    char name[64]{};
+    char target[16]{};
+    char idf[24]{};
+    char published_at[32]{};
     char firmware_url[384]{};
+    char release_url[256]{};
     char sha256[65]{};
-    char message[128]{"Ainda não verificado"};
+    char notes[1024]{};
+    char message[160]{"Ainda não verificado"};
 };
 
 struct OnlineUpdateManifest {
     char version[16]{};
+    char name[64]{};
+    char target[16]{};
+    char idf[24]{};
+    char published_at[32]{};
     char firmware_url[384]{};
+    char release_url[256]{};
     char sha256[65]{};
+    char notes[1024]{};
     int64_t size{0};
 };
 
@@ -736,7 +748,7 @@ static esp_err_t manifest_http_event(esp_http_client_event_t *evt) {
     auto *buffer = static_cast<ManifestHttpBuffer *>(evt->user_data);
     if (!buffer) return ESP_OK;
     if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data && evt->data_len > 0) {
-        if (buffer->body.size() + static_cast<size_t>(evt->data_len) > 4096) {
+        if (buffer->body.size() + static_cast<size_t>(evt->data_len) > 8192) {
             buffer->overflow = true;
             return ESP_OK;
         }
@@ -758,17 +770,49 @@ static int compare_versions(const char *a, const char *b) {
     return 0;
 }
 
+static bool system_time_valid() {
+    return time(nullptr) > 1700000000;
+}
+
+static bool ensure_https_time(char *error, size_t error_len) {
+    if (system_time_valid()) return true;
+
+    add_log("UPDATE", "Aguardando sincronização NTP antes do HTTPS");
+    for (int attempt = 0; attempt < 3 && !system_time_valid(); ++attempt) {
+        const esp_err_t sync = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(5000));
+        if (sync != ESP_OK && sync != ESP_ERR_TIMEOUT) {
+            add_log("UPDATE", "SNTP ainda não pronto: %s", esp_err_to_name(sync));
+        }
+    }
+
+    if (!system_time_valid()) {
+        snprintf(error, error_len, "Relógio não sincronizado via NTP; HTTPS indisponível");
+        return false;
+    }
+
+    time_t now = time(nullptr);
+    struct tm local{};
+    localtime_r(&now, &local);
+    char stamp[40]{};
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &local);
+    add_log("UPDATE", "Relógio válido para HTTPS: %s", stamp);
+    return true;
+}
+
 static bool fetch_online_manifest(OnlineUpdateManifest &out, char *error, size_t error_len) {
+    if (!ensure_https_time(error, error_len)) return false;
+
     ManifestHttpBuffer buffer;
-    buffer.body.reserve(1024);
+    buffer.body.reserve(2048);
 
     esp_http_client_config_t cfg{};
     cfg.url = UPDATE_MANIFEST_URL;
     cfg.event_handler = manifest_http_event;
     cfg.user_data = &buffer;
     cfg.timeout_ms = 25000;
-    cfg.max_redirection_count = 8;
+    cfg.max_redirection_count = 4;
     cfg.keep_alive_enable = false;
+    cfg.buffer_size = 2048;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.user_agent = "Polar-DStar-ESP32/online-update";
 
@@ -778,12 +822,14 @@ static bool fetch_online_manifest(OnlineUpdateManifest &out, char *error, size_t
         return false;
     }
     esp_http_client_set_header(client, "Connection", "close");
+    esp_http_client_set_header(client, "Cache-Control", "no-cache");
     esp_err_t err = esp_http_client_perform(client);
     const int status = esp_http_client_get_status_code(client);
+    const int sock_errno = esp_http_client_get_errno(client);
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
-        snprintf(error, error_len, "Falha HTTPS: %s", esp_err_to_name(err));
+        snprintf(error, error_len, "Falha HTTPS: %s (errno %d)", esp_err_to_name(err), sock_errno);
         return false;
     }
     if (status != 200) {
@@ -801,8 +847,14 @@ static bool fetch_online_manifest(OnlineUpdateManifest &out, char *error, size_t
         return false;
     }
     cJSON *version = cJSON_GetObjectItemCaseSensitive(json, "version");
+    cJSON *name = cJSON_GetObjectItemCaseSensitive(json, "name");
+    cJSON *target = cJSON_GetObjectItemCaseSensitive(json, "target");
+    cJSON *idf = cJSON_GetObjectItemCaseSensitive(json, "idf");
+    cJSON *published_at = cJSON_GetObjectItemCaseSensitive(json, "published_at");
     cJSON *firmware = cJSON_GetObjectItemCaseSensitive(json, "firmware");
+    cJSON *release_url = cJSON_GetObjectItemCaseSensitive(json, "release_url");
     cJSON *sha256 = cJSON_GetObjectItemCaseSensitive(json, "sha256");
+    cJSON *notes = cJSON_GetObjectItemCaseSensitive(json, "notes");
     cJSON *size = cJSON_GetObjectItemCaseSensitive(json, "size");
 
     const bool valid = cJSON_IsString(version) && version->valuestring &&
@@ -819,17 +871,22 @@ static bool fetch_online_manifest(OnlineUpdateManifest &out, char *error, size_t
     copy_cstr(out.version, version->valuestring);
     copy_cstr(out.firmware_url, firmware->valuestring);
     copy_cstr(out.sha256, sha256->valuestring);
+    if (cJSON_IsString(name) && name->valuestring) copy_cstr(out.name, name->valuestring);
+    if (cJSON_IsString(target) && target->valuestring) copy_cstr(out.target, target->valuestring);
+    if (cJSON_IsString(idf) && idf->valuestring) copy_cstr(out.idf, idf->valuestring);
+    if (cJSON_IsString(published_at) && published_at->valuestring) copy_cstr(out.published_at, published_at->valuestring);
+    if (cJSON_IsString(release_url) && release_url->valuestring) copy_cstr(out.release_url, release_url->valuestring);
+    if (cJSON_IsString(notes) && notes->valuestring) copy_cstr(out.notes, notes->valuestring);
     out.size = static_cast<int64_t>(size->valuedouble);
     cJSON_Delete(json);
 
-    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
-    if (!target || out.size > static_cast<int64_t>(target->size)) {
+    const esp_partition_t *target_partition = esp_ota_get_next_update_partition(nullptr);
+    if (!target_partition || out.size > static_cast<int64_t>(target_partition->size)) {
         snprintf(error, error_len, "Firmware online não cabe na partição OTA");
         return false;
     }
     return true;
 }
-
 static void update_set_failure(const char *message) {
     xSemaphoreTake(g_update_mutex, portMAX_DELAY);
     g_update.checking = false;
@@ -857,8 +914,14 @@ static void online_update_check_task(void *) {
         g_update.progress = 0;
         g_update.size = manifest.size;
         copy_cstr(g_update.version, manifest.version);
+        copy_cstr(g_update.name, manifest.name);
+        copy_cstr(g_update.target, manifest.target);
+        copy_cstr(g_update.idf, manifest.idf);
+        copy_cstr(g_update.published_at, manifest.published_at);
         copy_cstr(g_update.firmware_url, manifest.firmware_url);
+        copy_cstr(g_update.release_url, manifest.release_url);
         copy_cstr(g_update.sha256, manifest.sha256);
+        copy_cstr(g_update.notes, manifest.notes);
         const int cmp = compare_versions(POLAR_DSTAR_VERSION, manifest.version);
         g_update.available = cmp < 0;
         if (cmp < 0) {
@@ -880,8 +943,14 @@ static void online_update_install_task(void *) {
     OnlineUpdateManifest manifest{};
     xSemaphoreTake(g_update_mutex, portMAX_DELAY);
     copy_cstr(manifest.version, g_update.version);
+    copy_cstr(manifest.name, g_update.name);
+    copy_cstr(manifest.target, g_update.target);
+    copy_cstr(manifest.idf, g_update.idf);
+    copy_cstr(manifest.published_at, g_update.published_at);
     copy_cstr(manifest.firmware_url, g_update.firmware_url);
+    copy_cstr(manifest.release_url, g_update.release_url);
     copy_cstr(manifest.sha256, g_update.sha256);
+    copy_cstr(manifest.notes, g_update.notes);
     manifest.size = g_update.size;
     xSemaphoreGive(g_update_mutex);
 
@@ -889,6 +958,14 @@ static void online_update_install_task(void *) {
     if (!target) {
         update_set_failure("Nenhuma partição OTA disponível");
         add_log("UPDATE", "Nenhuma partição OTA disponível");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    char time_error[160]{};
+    if (!ensure_https_time(time_error, sizeof(time_error))) {
+        update_set_failure(time_error);
+        add_log("UPDATE", "%s", time_error);
         vTaskDelete(nullptr);
         return;
     }
@@ -982,7 +1059,28 @@ static void online_update_install_task(void *) {
 static esp_err_t api_update_get(httpd_req_t *req) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "installed", POLAR_DSTAR_VERSION);
+    cJSON_AddStringToObject(root, "installed_name", POLAR_DSTAR_NAME);
+    cJSON_AddStringToObject(root, "installed_notes", POLAR_DSTAR_RELEASE_NOTES);
+    cJSON_AddStringToObject(root, "installed_build_date", __DATE__);
+    cJSON_AddStringToObject(root, "installed_build_time", __TIME__);
+    cJSON_AddStringToObject(root, "installed_idf", esp_get_idf_version());
+    cJSON_AddStringToObject(root, "installed_target", "esp32s3");
     cJSON_AddStringToObject(root, "manifest_url", UPDATE_MANIFEST_URL);
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    cJSON_AddStringToObject(root, "installed_partition", running ? running->label : "desconhecida");
+    cJSON_AddNumberToObject(root, "installed_partition_size",
+                            running ? static_cast<double>(running->size) : 0.0);
+
+    char elf_sha[65]{};
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    if (app_desc) {
+        for (size_t i = 0; i < sizeof(app_desc->app_elf_sha256); ++i) {
+            snprintf(elf_sha + (i * 2), sizeof(elf_sha) - (i * 2), "%02x",
+                     static_cast<unsigned>(app_desc->app_elf_sha256[i]));
+        }
+    }
+    cJSON_AddStringToObject(root, "installed_elf_sha256", elf_sha);
 
     xSemaphoreTake(g_update_mutex, portMAX_DELAY);
     cJSON_AddBoolToObject(root, "checked", g_update.checked);
@@ -992,12 +1090,17 @@ static esp_err_t api_update_get(httpd_req_t *req) {
     cJSON_AddNumberToObject(root, "progress", g_update.progress);
     cJSON_AddNumberToObject(root, "size", static_cast<double>(g_update.size));
     cJSON_AddStringToObject(root, "latest", g_update.version);
+    cJSON_AddStringToObject(root, "latest_name", g_update.name);
+    cJSON_AddStringToObject(root, "latest_target", g_update.target);
+    cJSON_AddStringToObject(root, "latest_idf", g_update.idf);
+    cJSON_AddStringToObject(root, "latest_published_at", g_update.published_at);
+    cJSON_AddStringToObject(root, "latest_release_url", g_update.release_url);
+    cJSON_AddStringToObject(root, "latest_notes", g_update.notes);
     cJSON_AddStringToObject(root, "sha256", g_update.sha256);
     cJSON_AddStringToObject(root, "message", g_update.message);
     xSemaphoreGive(g_update_mutex);
     return send_json(req, root);
 }
-
 static esp_err_t api_update_check(httpd_req_t *req) {
     if (!wifi_station_connected()) return send_error(req, 400, "Conecte o hotspot à Internet antes de verificar");
     if (g_host_syncing.load()) return send_error(req, 400, "Aguarde a sincronização dos hosts terminar");
@@ -1583,7 +1686,7 @@ extern "C" void app_main(void) {
     g_hosts_mutex = xSemaphoreCreateMutex();
     g_update_mutex = xSemaphoreCreateMutex();
     add_log("BOOT", "%s v%s", POLAR_DSTAR_NAME, POLAR_DSTAR_VERSION);
-    add_log("BOOT", "v0.1.8: atualização online pelo GitHub");
+    add_log("BOOT", "v0.1.9: OTA online robusta + detalhes das releases");
     add_log("BOOT", "Reset reason: %d", static_cast<int>(esp_reset_reason()));
     add_log("MMDVM", "Driver serial reservado para v0.2");
     load_config();
